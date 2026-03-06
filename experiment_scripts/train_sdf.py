@@ -1,14 +1,9 @@
-'''Reproduces Sec. 4.2 in main paper and Sec. 4 in Supplement.
-Modification
-'''
-
-# Enable import from parent package
 import sys
 import os
 import torch
 sys.path.append( os.path.dirname( os.path.dirname( os.path.abspath(__file__) ) ) )
 
-import dataio, meta_modules, utils, training, loss_functions, modules
+import dataio, meta_modules, utils, training, loss_functions, modules, dataio_2d
 
 from torch.utils.data import DataLoader
 import configargparse
@@ -34,7 +29,7 @@ p.add_argument('--steps_til_summary', type=int, default=100,
 p.add_argument('--model_type', type=str, default='sine',
                help='Options are "sine" (all sine activations) and "mixed" (first layer sine, other layers tanh)')
 p.add_argument('--point_cloud_path', type=str, default='/home/sitzmann/data/point_cloud.xyz',
-               help='Path to point cloud file')
+               help='Options are "sine" (all sine activations) and "mixed" (first layer sine, other layers tanh)')
 
 p.add_argument('--checkpoint_path', default=None, help='Checkpoint to trained model.')
 
@@ -59,7 +54,7 @@ p.add_argument('--k_neighbors', type=int, default=16,
 
 opt = p.parse_args()
 
-# ==================== Choose dataset based on dimension ====================
+# ==================== MODIFIED: Choose dataset based on dimension ====================
 if opt.sdf_dimension == 2:
     print("=" * 60)
     print("2D SDF Training Mode")
@@ -67,27 +62,44 @@ if opt.sdf_dimension == 2:
     
     # Create visualization directory only if flag is True
     vis_dir = None
+    vis_frequency = None
+
     if opt.vis_sampled_point:
         vis_dir = os.path.join(opt.logging_root, opt.experiment_name, 'batch_viz')
-        print(f"  Point visualization enabled, saving every {opt.vis_frequency} epochs to: {vis_dir}")
+        vis_frequency = opt.vis_frequency
+        print(f"  Point visualization enabled, saving every {vis_frequency} epochs to: {vis_dir}")
     
     # Print label mode info
     label_mode = "SIGNED (+1/-1)" if opt.use_signed_labels else "ORIGINAL (-1 only)"
     print(f"  Label mode: {label_mode}")
-    if opt.plane_csv:
-        print(f"  Using plane file: {opt.plane_csv}")
 
-    # Use the unified PointCloud2D class
-    sdf_dataset = dataio.PointCloud2D(
-        pointcloud_path=opt.point_cloud_path,
-        on_surface_points=opt.batch_size,
-        plane_csv=opt.plane_csv,  # Will be None if not provided
-        use_signed_labels=opt.use_signed_labels,
-        k_neighbors=opt.k_neighbors,
-        vis_sampled_point=opt.vis_sampled_point,
-        vis_frequency=opt.vis_frequency,
-        vis_dir=vis_dir
-    )
+    if opt.plane_csv is None:
+        # Assume point cloud is already in 2D format
+        sdf_dataset = dataio_2d.PointCloud2D(
+            pointcloud_path=opt.point_cloud_path,
+            on_surface_points=opt.batch_size,
+            use_signed_labels=opt.use_signed_labels,
+            k_neighbors=opt.k_neighbors,
+            vis_sampled_point=opt.vis_sampled_point,
+            vis_frequency=vis_frequency,
+            vis_dir=vis_dir
+        )
+    else:
+        # Load plane parameters
+        plane_origin, plane_normal = dataio_2d.load_plane_csv(opt.plane_csv)
+        
+        # Create 2D cross-section dataset
+        sdf_dataset = dataio_2d.CrossSection2D(
+            point_cloud_path=opt.point_cloud_path,
+            plane_origin=plane_origin,
+            plane_normal=plane_normal,
+            on_surface_points=opt.batch_size,
+            use_signed_labels=opt.use_signed_labels,
+            k_neighbors=opt.k_neighbors, 
+            vis_sampled_point=opt.vis_sampled_point,
+            vis_frequency=vis_frequency, 
+            vis_dir=vis_dir
+        )
     
     in_features = 2
 else:
@@ -100,25 +112,25 @@ else:
         opt.point_cloud_path, 
         on_surface_points=opt.batch_size
     )
-    in_features = 3
+    in_features = 3  # 3D input for model
 
 dataloader = DataLoader(sdf_dataset, shuffle=True, batch_size=1, pin_memory=True, num_workers=0)
 
-# ==================== Model definition ====================
+# ==================== Model definition (works for both 2D and 3D) ====================
 if opt.model_type == 'nerf':
     model = modules.SingleBVPNet(
         type='relu', 
         mode='nerf', 
-        in_features=opt.sdf_dimension
+        in_features=opt.sdf_dimension  # Dynamically set based on dimension
     )
 else:
     model = modules.SingleBVPNet(
         type=opt.model_type, 
-        in_features=opt.sdf_dimension
+        in_features=opt.sdf_dimension   # Dynamically set based on dimension
     )
 model.cuda()
 
-# Replace summary_fn with a dummy function for 2D
+# Replace summary_fn with a dummy function
 def dummy_summary(*args, **kwargs):
     pass
 
