@@ -3,6 +3,7 @@
 #!/usr/bin/env python3
 
 import logging
+import os
 import numpy as np
 import plyfile
 import skimage.measure
@@ -95,11 +96,13 @@ def convert_sdf_samples_to_ply(
     numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.numpy()
 
     verts, faces, normals, values = np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0)
+    # Edit from skimage.measure.marching_cubes_lewiner to skimage.measure.marching_cubes
     try:
-        verts, faces, normals, values = skimage.measure.marching_cubes_lewiner(
+        verts, faces, normals, values = skimage.measure.marching_cubes(
             numpy_3d_sdf_tensor, level=0.0, spacing=[voxel_size] * 3
         )
-    except:
+    except Exception as e:
+        print("[DEBUG] marching_cube failed:", e)
         pass
 
     # transform from voxel coordinates to camera coordinates
@@ -134,8 +137,20 @@ def convert_sdf_samples_to_ply(
     el_faces = plyfile.PlyElement.describe(faces_tuple, "face")
 
     ply_data = plyfile.PlyData([el_verts, el_faces])
-    logging.debug("saving mesh to %s" % (ply_filename_out))
-    ply_data.write(ply_filename_out)
+    
+    # Save reconstructed mesh
+    rec_name = os.path.splitext(os.path.basename(ply_filename_out))[0]
+    rec_dir = os.path.dirname(ply_filename_out)
+    i = 1
+    
+    while True:
+        rec_name_i = os.path.join(rec_dir, f"{rec_name}_rec_{i}.ply")
+        if not os.path.exists(rec_name_i):
+            break
+        i += 1
+
+    logging.debug("saving mesh to %s" % (rec_name_i))
+    ply_data.write(rec_name_i)
 
     logging.debug(
         "converting to ply format and writing to file took {} s".format(
