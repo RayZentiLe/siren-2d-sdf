@@ -415,6 +415,190 @@ def visualize_training_batch_signed(coords, gt_sdf, epoch, save_dir, batch_idx=0
     print(f"  Saved signed batch visualization to: {save_path}")
 
 
+def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir, batch_idx=0):
+    """
+    Visualization for REAL SDF values with color mapping.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    gt_sdf_flat = gt_sdf.flatten()
+    n_points = len(coords)
+    n_on = n_points // 2
+    
+    # Separate points
+    on_coords = coords[:n_on]
+    off_coords = coords[n_on:]
+    off_sdf = gt_sdf_flat[n_on:]
+    off_dist = distances if distances is not None else np.abs(off_sdf)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Plot 1: On-surface points (green)
+    ax = axes[0]
+    ax.scatter(on_coords[:, 0], on_coords[:, 1], 
+               c='green', s=5, alpha=0.8, label=f'On-surface ({n_on})')
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_title(f'On-Surface Points (Epoch {epoch})')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 2: Off-surface points colored by signed distance
+    ax = axes[1]
+    scatter = ax.scatter(off_coords[:, 0], off_coords[:, 1], 
+                        c=off_sdf, cmap='RdBu_r', s=5, alpha=0.8,
+                        vmin=-0.5, vmax=0.5)
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_title('Off-Surface Points (colored by SDF)')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=ax, label='Signed Distance')
+    
+    # Plot 3: Distance histogram
+    ax = axes[2]
+    ax.hist(off_dist, bins=50, alpha=0.7, color='blue')
+    ax.set_xlabel('Distance')
+    ax.set_ylabel('Count')
+    ax.set_title(f'Distance Distribution\nmean={off_dist.mean():.4f}, std={off_dist.std():.4f}')
+    ax.grid(True, alpha=0.3)
+    
+    plt.suptitle(f'REAL SDF - Epoch {epoch} (Batch {batch_idx})')
+    plt.tight_layout()
+    
+    filename = f'real_sdf_epoch_{epoch:04d}.png'
+    save_path = os.path.join(save_dir, filename)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Also print stats
+    print(f"  REAL SDF stats - mean={off_sdf.mean():.4f}, std={off_sdf.std():.4f}, "
+          f"range=[{off_sdf.min():.4f}, {off_sdf.max():.4f}]")
+
+# ==================== REAL SDF COMPUTATION FUNCTIONS ====================
+
+def compute_real_sdf_values(on_coords, off_coords, on_normals, 
+                            use_signed_labels, knn_model, on_points_norm):
+    """
+    Compute REAL SDF values using the FULL dataset for kNN queries.
+    
+    Args:
+        on_coords: [N, D] on-surface points (batch subset)
+        off_coords: [M, D] off-surface points
+        on_normals: [total_N, D] FULL dataset normals
+        use_signed_labels: bool
+        knn_model: kNN trained on FULL dataset
+        on_points_norm: [total_N, D] FULL dataset points
+    
+    Returns:
+        sdf: [N+M] array
+        sdf_on: [N] array (zeros)
+        sdf_off: [M] array
+        distances: [M] array of raw distances
+    """
+    # On-surface points always 0
+    sdf_on = np.zeros(on_coords.shape[0])
+    
+    if use_signed_labels:
+        # Find nearest neighbors in FULL dataset for each off-surface point
+        distances, indices = knn_model.kneighbors(off_coords, n_neighbors=1)
+        
+        # Get the nearest points and their normals from FULL dataset
+        nearest_points = on_points_norm[indices[:, 0]]  # [M, D]
+        nearest_normals = on_normals[indices[:, 0]]     # [M, D]
+        
+        # Raw Euclidean distances
+        raw_distances = distances.flatten()  # [M]
+        
+        # Vector from off-surface point to nearest on-surface point
+        vectors = off_coords - nearest_points  # [M, D]
+        
+        # Project onto normal to determine sign
+        proj = np.sum(vectors * nearest_normals, axis=1)  # [M]
+        
+        # Sign: +1 where projection > 0 (outside), -1 otherwise (inside)
+        signs = np.where(proj > 0, 1.0, -1.0)
+        
+        # Signed distance
+        sdf_off = raw_distances * signs
+    else:
+        sdf_off = np.ones(off_coords.shape[0]) * -1
+        raw_distances = None
+    
+    sdf = np.concatenate([sdf_on, sdf_off])
+    return sdf, sdf_on, sdf_off, raw_distances
+
+
+def _compute_real_signed_distances(off_coords, on_points_norm, on_normals, knn_model):
+    """
+    Compute REAL signed distances for off-surface points. (Only signed, no distances, all off surface will be assigned to 1 or -1)
+    
+    For each off-surface point:
+        1. Find nearest on-surface point
+        2. Compute Euclidean distance
+        3. Determine sign based on normal alignment
+        4. Return signed distance
+    
+    Args:
+        off_coords: [M, D] off-surface points
+        on_points_norm: [N, D] normalized on-surface points
+        on_normals: [N, D] normals of on-surface points
+        knn_model: Fitted NearestNeighbors model
+    
+    Returns:
+        signed_distances: [M] array of signed distances (real values)
+        raw_distances: [M] array of raw Euclidean distances
+    """
+    # Find nearest neighbor for each off-surface point
+    distances, indices = knn_model.kneighbors(off_coords, n_neighbors=1)
+    
+    # Get the nearest on-surface points and their normals
+    nearest_points = on_points_norm[indices[:, 0]]  # [M, D]
+    nearest_normals = on_normals[indices[:, 0]]     # [M, D]
+    
+    # Raw Euclidean distances (flatten from [M,1] to [M])
+    raw_distances = distances.flatten()
+    
+    # Vector from off-surface point to nearest on-surface point
+    # (note: direction matters for sign)
+    vectors = off_coords - nearest_points  # [M, D]
+    
+    # Project onto normal to determine sign
+    # If vector points in same direction as normal -> outside (+)
+    # If opposite direction -> inside (-)
+    proj = np.sum(vectors * nearest_normals, axis=1)  # [M]
+    
+    # Sign: +1 where projection > 0 (outside), -1 otherwise (inside)
+    signs = np.where(proj > 0, 1.0, -1.0)
+    
+    # Signed distance = raw distance * sign
+    signed_distances = raw_distances * signs
+    
+    return signed_distances, raw_distances
+
+
+def prepare_knn_for_sdf(points_norm, k_neighbors=16):
+    """
+    Prepare kNN model for finding nearest neighbors.
+    Works for both 2D and 3D.
+    
+    Args:
+        points_norm: [N, D] normalized on-surface points
+        k_neighbors: Number of neighbors to store (can be 1 for just nearest)
+    
+    Returns:
+        knn_model: Fitted NearestNeighbors model
+    """
+    knn_model = NearestNeighbors(n_neighbors=k_neighbors)
+    knn_model.fit(points_norm)
+    return knn_model
+
+
 # ==================== ORIGINAL DATASET CLASSES ====================
 
 class InverseHelmholtz(Dataset):
@@ -1115,81 +1299,70 @@ class CompositeGradients(Dataset):
 
 
 # ==================== 2D SDF DATASET CLASSES ====================
+
 class PointCloud2D(Dataset):
     """
-    Unified dataset for 2D SDF training.
-    
-    Handles two cases automatically:
-    1. If plane_csv is provided: Transforms 3D cross-section to 2D
-    2. If plane_csv is None: Assumes data is already in 2D format (x, y, nx, ny)
+    Unified dataset for 2D SDF training with REAL signed distances.
     """
     
     def __init__(self, pointcloud_path, on_surface_points, 
                  plane_csv=None,
-                 use_signed_labels=False, k_neighbors=16,
+                 use_signed_labels=False, k_neighbors=1,
                  vis_sampled_point=False, vis_frequency=100, vis_dir=None):
-        """
-        Args:
-            pointcloud_path: Path to .xyz file
-                - If plane_csv provided: expects 3D format (x, y, z, nx, ny, nz)
-                - If plane_csv=None: expects 2D format (x, y, nx, ny)
-            on_surface_points: Number of on-surface points per batch
-            plane_csv: Optional CSV with plane parameters (p0x,p0y,p0z,nx,ny,nz)
-            use_signed_labels: If True, off-surface points get +1/-1 labels based on normals
-            k_neighbors: Number of neighbors for sign determination
-            vis_sampled_point: Enable batch visualization
-            vis_frequency: Save visualization every N epochs
-            vis_dir: Directory to save visualizations
-        """
         super().__init__()
         
         self.on_surface_points = on_surface_points
         self.use_signed_labels = use_signed_labels
         self.k_neighbors = k_neighbors
         self.plane_csv = plane_csv
-        self.data_source = "unknown"
-        
-        # Load data based on whether plane_csv is provided
-        if plane_csv is not None:
-            # Case 1: 3D point cloud + plane definition
-            self._load_3d_with_plane(pointcloud_path, plane_csv)
-        else:
-            # Case 2: Data already in 2D format
-            self._load_2d_data(pointcloud_path)
-        
-        # Setup for signed labeling if needed
-        if self.use_signed_labels:
-            print(f"  Signed labels ENABLED: fitting kNN (k={k_neighbors}) for sign determination...")
-            from sklearn.neighbors import NearestNeighbors
-            self.knn_model = NearestNeighbors(n_neighbors=k_neighbors)
-            self.knn_model.fit(self.points_norm)
-            self.on_normals = self.normals
-        else:
-            print(f"  Signed labels DISABLED: using original -1 for all off-surface points")
-        
-        # Visualization setup
         self.vis_sampled_point = vis_sampled_point
         self.vis_frequency = vis_frequency
         self.vis_dir = vis_dir
         self.epoch_counter = 0
         
+        # Load data (either 2D direct or 3D + plane)
+        self._load_data(pointcloud_path, plane_csv)
+        
+        # STORE THE FULL DATASET for kNN queries
+        self.all_points_norm = self.points_norm.copy()  # Full set of normalized points
+        self.all_normals = self.normals.copy()          # Full set of normals
+        
+        # Setup for signed labeling if needed
+        if self.use_signed_labels:
+            print(f"  REAL SDF ENABLED: preparing kNN (k={k_neighbors}) for distance computation...")
+            self.knn_model = NearestNeighbors(n_neighbors=k_neighbors)
+            self.knn_model.fit(self.all_points_norm)  # Fit on FULL dataset
+        else:
+            print(f"  REAL SDF DISABLED: using original -1 for all off-surface points")
+            self.knn_model = None
+        
         # Print dataset info
         self._print_info()
         
+        # Visualization setup
         if self.vis_sampled_point and self.vis_dir:
             os.makedirs(self.vis_dir, exist_ok=True)
-            mode_str = 'signed' if use_signed_labels else 'original'
+            mode_str = 'real_sdf' if use_signed_labels else 'original'
             print(f"  Batch visualizations ({mode_str} mode) saved every {self.vis_frequency} epochs to: {self.vis_dir}")
     
+    def _load_data(self, pointcloud_path, plane_csv):
+        """Load data based on whether plane_csv is provided."""
+        if plane_csv is not None:
+            self._load_3d_with_plane(pointcloud_path, plane_csv)
+        else:
+            self._load_2d_data(pointcloud_path)
+    
     def _load_2d_data(self, pointcloud_path):
-        """Load data that's already in 2D format (x, y, nx, ny)."""
+        """Load data already in 2D format."""
         print(f"Loading 2D point cloud from: {pointcloud_path}")
         data = np.genfromtxt(pointcloud_path)
-        
-        self.points_raw = data[:, :2]  # Store raw points
+        points_raw = data[:, :2]
         self.normals = data[:, 2:4]
         
-        # Normalize to [-1, 1]
+        # Store original points for potential use
+        self.points_raw = points_raw.copy()
+        
+        # Normalize to [-1, 1] for SIREN
         self.points_raw -= np.mean(self.points_raw, axis=0, keepdims=True)
         coord_max = np.amax(np.abs(self.points_raw))
         if coord_max < 1e-6:
@@ -1197,75 +1370,8 @@ class PointCloud2D(Dataset):
         self.points_norm = self.points_raw / coord_max
         
         self.data_source = "2D direct"
-        self.transform_info = None  # No transform for 2D data
-    
-    def _load_plane_csv(self, plane_csv):
-        """Load plane parameters from CSV file."""
-        plane_params = np.loadtxt(plane_csv, delimiter=",", skiprows=1)
-        if plane_params.ndim == 1:
-            plane_params = plane_params.reshape(1, -1)
-        return plane_params[0, :3], plane_params[0, 3:6]
-    
-    def _transform_plane_to_xy(self, points_3d, normals_3d, plane_origin, plane_normal):
-        """Transform points and normals so plane becomes XY plane."""
-        # Shift to plane origin
-        points_shifted = points_3d - plane_origin
-        
-        # Build rotation matrix to align plane_normal with [0, 0, 1]
-        z_axis = plane_normal / np.linalg.norm(plane_normal)
-        
-        # Find arbitrary perpendicular vectors
-        if abs(z_axis[0]) < 0.9:
-            x_axis = np.cross(z_axis, [1, 0, 0])
-        else:
-            x_axis = np.cross(z_axis, [0, 1, 0])
-        x_axis = x_axis / np.linalg.norm(x_axis)
-        
-        y_axis = np.cross(z_axis, x_axis)
-        y_axis = y_axis / np.linalg.norm(y_axis)
-        
-        # Rotation matrix
-        R = np.vstack([x_axis, y_axis, z_axis]).T
-        
-        # Apply rotation
-        points_rotated = points_shifted @ R
-        points_2d = points_rotated[:, :2]
-        
-        # Transform and project normals
-        normals_rotated = normals_3d @ R
-        normals_2d = normals_rotated[:, :2]
-        norm_norms = np.linalg.norm(normals_2d, axis=1, keepdims=True)
-        normals_2d = normals_2d / (norm_norms + 1e-8)
-        
-        # Store transform info for potential back-transform
-        transform_info = {
-            'rotation_matrix': R,
-            'plane_origin': plane_origin,
-            'x_axis': x_axis,
-            'y_axis': y_axis,
-            'z_axis': z_axis
-        }
-        
-        return points_2d, normals_2d, transform_info
-    
-    def _normalize_to_unit_square(self, points_2d):
-        """Normalize 2D points to [-1, 1] range."""
-        mean = np.mean(points_2d, axis=0, keepdims=True)
-        points_centered = points_2d - mean
-        
-        max_abs = np.amax(np.abs(points_centered))
-        if max_abs < 1e-6:
-            max_abs = 1.0
-        
-        scale = max_abs
-        points_norm = points_centered / scale
-        
-        norm_params = {
-            'mean': mean.flatten(),
-            'scale': scale
-        }
-        
-        return points_norm, norm_params
+        self.transform_info = None
+        self.norm_params = {'mean': np.zeros(2), 'scale': coord_max}
     
     def _load_3d_with_plane(self, pointcloud_path, plane_csv):
         """Load 3D point cloud and transform using plane parameters."""
@@ -1279,17 +1385,25 @@ class PointCloud2D(Dataset):
         print(f"  Loaded {len(points_3d)} points")
         
         # Load plane parameters
-        plane_origin, plane_normal = self._load_plane_csv(plane_csv)
+        plane_params = np.loadtxt(plane_csv, delimiter=",", skiprows=1)
+        if plane_params.ndim == 1:
+            plane_params = plane_params.reshape(1, -1)
+        plane_origin = plane_params[0, :3]
+        plane_normal = plane_params[0, 3:6]
         print(f"  Plane origin: {plane_origin}")
         print(f"  Plane normal: {plane_normal}")
         
         # Transform to XY plane
-        self.points_raw, self.normals, self.transform_info = self._transform_plane_to_xy(
+        points_2d, normals_2d, self.transform_info = transform_plane_to_xy(
             points_3d, normals_3d, plane_origin, plane_normal
         )
         
+        # Store transformed points
+        self.points_raw = points_2d.copy()
+        self.normals = normals_2d.copy()
+        
         # Normalize to [-1, 1]
-        self.points_norm, self.norm_params = self._normalize_to_unit_square(self.points_raw)
+        self.points_norm, self.norm_params = normalize_to_unit_square(self.points_raw)
         
         self.data_source = "3D + plane"
     
@@ -1299,29 +1413,15 @@ class PointCloud2D(Dataset):
         print(f"  Points: {len(self.points_norm)} on-surface points")
         print(f"  Normalized range: u=[{self.points_norm[:,0].min():.3f}, {self.points_norm[:,0].max():.3f}], "
               f"v=[{self.points_norm[:,1].min():.3f}, {self.points_norm[:,1].max():.3f}]")
-        print(f"  Label mode: {'SIGNED (+1/-1)' if self.use_signed_labels else 'ORIGINAL (-1 only)'}")
+        print(f"  Label mode: {'REAL SDF (signed distances)' if self.use_signed_labels else 'ORIGINAL (-1 only)'}")
     
     def __len__(self):
         return max(1, self.points_norm.shape[0] // self.on_surface_points)
     
-    def _label_off_surface_points_signed(self, off_coords_norm):
-        """Assign signed values (+1 outside, -1 inside) using kNN."""
-        N_off = off_coords_norm.shape[0]
-        distances, indices = self.knn_model.kneighbors(off_coords_norm)
-        
-        neighbor_normals = self.normals[indices]  # [N_off, k, 2]
-        vectors = off_coords_norm[:, np.newaxis, :] - self.points_norm[indices]  # [N_off, k, 2]
-        
-        proj = np.sum(vectors * neighbor_normals, axis=2)  # [N_off, k]
-        mean_proj = np.mean(proj, axis=1)
-        
-        signs = np.where(mean_proj > 0, 1.0, -1.0)
-        return signs
-    
     def __getitem__(self, idx):
         n_points = self.points_norm.shape[0]
         
-        # On-surface points
+        # On-surface points (random subset for this batch)
         if n_points >= self.on_surface_points:
             on_idx = np.random.choice(n_points, self.on_surface_points, replace=False)
         else:
@@ -1334,16 +1434,24 @@ class PointCloud2D(Dataset):
         off_coords = np.random.uniform(-1, 1, size=(self.on_surface_points, 2))
         off_normals = np.ones((self.on_surface_points, 2)) * -1
         
-        # Determine SDF values based on mode
-        sdf_on = np.zeros(self.on_surface_points)
-        
+        # === USE REAL SDF COMPUTATION FUNCTION WITH FULL DATASET ===
         if self.use_signed_labels:
-            off_signs = self._label_off_surface_points_signed(off_coords)
-            sdf_off = off_signs
+            # Pass the FULL dataset for kNN queries, not just the batch subset
+            sdf, sdf_on, sdf_off, distances = compute_real_sdf_values(
+                on_coords=on_coords,                    # Batch subset for on-surface
+                off_coords=off_coords,                  # Batch subset for off-surface
+                on_normals=self.all_normals,            # FULL dataset normals
+                use_signed_labels=True,
+                knn_model=self.knn_model,               # kNN trained on FULL dataset
+                on_points_norm=self.all_points_norm     # FULL dataset points
+            )
         else:
+            # Original mode: all off-surface = -1
+            sdf_on = np.zeros(self.on_surface_points)
             sdf_off = np.ones(self.on_surface_points) * -1
+            sdf = np.concatenate([sdf_on, sdf_off])
+            distances = None
         
-        sdf = np.concatenate([sdf_on, sdf_off])
         coords = np.vstack([on_coords, off_coords])
         normals = np.vstack([on_normals, off_normals])
         
@@ -1352,9 +1460,10 @@ class PointCloud2D(Dataset):
             self.epoch_counter % self.vis_frequency == 0):
             
             if self.use_signed_labels:
-                visualize_training_batch_signed(
+                visualize_training_batch_real_sdf(
                     coords=coords,
                     gt_sdf=sdf.reshape(-1, 1),
+                    distances=distances,
                     epoch=self.epoch_counter,
                     save_dir=self.vis_dir,
                     batch_idx=idx
@@ -1377,26 +1486,4 @@ class PointCloud2D(Dataset):
             'sdf': torch.from_numpy(sdf).float().unsqueeze(-1),
             'normals': torch.from_numpy(normals).float()
         }
-    
-    def transform_back(self, points_2d_norm):
-        """
-        Transform normalized points back to original 3D space.
-        Only works if data came from 3D + plane (has transform_info).
-        """
-        if self.transform_info is None:
-            raise ValueError("transform_back only available for data loaded with plane_csv")
-        
-        # Denormalize
-        points_2d = points_2d_norm * self.norm_params['scale'] + self.norm_params['mean']
-        
-        # Add z=0
-        points_3d_plane = np.hstack([points_2d, np.zeros((points_2d.shape[0], 1))])
-        
-        # Rotate back
-        R_inv = np.linalg.inv(self.transform_info['rotation_matrix'])
-        points_rotated = points_3d_plane @ R_inv
-        
-        # Shift back
-        points_3d = points_rotated + self.transform_info['plane_origin']
-        
-        return points_3d
+
