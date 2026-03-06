@@ -325,45 +325,61 @@ def write_sdf_summary_2d(model, model_input, gt, model_output, writer, total_ste
 
 def visualize_training_batch_original(coords, gt_sdf, epoch, save_dir, batch_idx=0):
     """
-    Original visualization: off-surface (red), on-surface (green)
+    Original visualization: off-surface (red), on-surface (green).
+    For 2D data this plots a scatter plot; for 3D data it writes a simple
+    colored PLY file (on-surface black, off-surface red).
     """
     os.makedirs(save_dir, exist_ok=True)
-    
+    coords = np.asarray(coords)
     gt_sdf_flat = gt_sdf.flatten()
     on_surface = gt_sdf_flat != -1
     off_surface = gt_sdf_flat == -1
-    
-    fig, ax = plt.subplots(figsize=(8, 8))
-    
-    if off_surface.any():
-        ax.scatter(coords[off_surface, 0], coords[off_surface, 1], 
-                  c='red', s=2, alpha=0.3, label=f'Off-surface ({off_surface.sum()})')
-    
-    if on_surface.any():
-        ax.scatter(coords[on_surface, 0], coords[on_surface, 1], 
-                  c='green', s=5, alpha=0.8, label=f'On-surface ({on_surface.sum()})')
-    
-    ax.set_xlim(-1.1, 1.1)
-    ax.set_ylim(-1.1, 1.1)
-    ax.set_xlabel('u')
-    ax.set_ylabel('v')
-    ax.set_title(f'Training Batch (Original) - Epoch {epoch} (Batch {batch_idx})')
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right')
-    
-    stats_text = f'Total: {len(coords)}\nOn: {on_surface.sum()}\nOff: {off_surface.sum()}'
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout()
-    
-    filename = f'training_batch_epoch_{epoch:04d}.png'
-    save_path = os.path.join(save_dir, filename)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"  Saved batch visualization to: {save_path}")
+
+    if coords.shape[1] == 2:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        if off_surface.any():
+            ax.scatter(coords[off_surface, 0], coords[off_surface, 1], 
+                      c='red', s=2, alpha=0.3, label=f'Off-surface ({off_surface.sum()})')
+        if on_surface.any():
+            ax.scatter(coords[on_surface, 0], coords[on_surface, 1], 
+                      c='green', s=5, alpha=0.8, label=f'On-surface ({on_surface.sum()})')
+        ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(-1.1, 1.1)
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_title(f'Training Batch (Original) - Epoch {epoch} (Batch {batch_idx})')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        stats_text = f'Total: {len(coords)}\nOn: {on_surface.sum()}\nOff: {off_surface.sum()}'
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        plt.tight_layout()
+        filename = f'training_batch_epoch_{epoch:04d}.png'
+        save_path = os.path.join(save_dir, filename)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved batch visualization to: {save_path}")
+    elif coords.shape[1] == 3:
+        # build colors: on-surface black, off-surface red
+        n_points = coords.shape[0]
+        colors = np.zeros((n_points, 3), dtype=np.uint8)
+        colors[off_surface, 0] = 255
+        filename = f'training_batch_epoch_{epoch:04d}_batch_{batch_idx:02d}.ply'
+        save_path = os.path.join(save_dir, filename)
+        with open(save_path, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {n_points}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for i in range(n_points):
+                x, y, z = coords[i]
+                r, g, b = colors[i]
+                f.write(f"{x} {y} {z} {r} {g} {b}\n")
+        print(f"  Saved 3D batch visualization to: {save_path}")
+    else:
+        raise ValueError(f"Unsupported coordinate dimension {coords.shape[1]} for original visualization")
 
 
 def visualize_training_batch_signed(coords, gt_sdf, epoch, save_dir, batch_idx=0):
@@ -417,68 +433,98 @@ def visualize_training_batch_signed(coords, gt_sdf, epoch, save_dir, batch_idx=0
 
 def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir, batch_idx=0):
     """
-    Visualization for REAL SDF values with color mapping.
+    Visualization for REAL SDF values with color mapping.  
+    In 2D this produces a set of matplotlib plots; in 3D the
+    batch is written to a colored PLY file (on-surface points black,
+    off-surface colored by distance).
     """
     os.makedirs(save_dir, exist_ok=True)
-    
+    coords = np.asarray(coords)
     gt_sdf_flat = gt_sdf.flatten()
     n_points = len(coords)
     n_on = n_points // 2
-    
+
     # Separate points
     on_coords = coords[:n_on]
     off_coords = coords[n_on:]
     off_sdf = gt_sdf_flat[n_on:]
     off_dist = distances if distances is not None else np.abs(off_sdf)
-    
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # Plot 1: On-surface points (green)
-    ax = axes[0]
-    ax.scatter(on_coords[:, 0], on_coords[:, 1], 
-               c='green', s=5, alpha=0.8, label=f'On-surface ({n_on})')
-    ax.set_xlim(-1.1, 1.1)
-    ax.set_ylim(-1.1, 1.1)
-    ax.set_xlabel('u')
-    ax.set_ylabel('v')
-    ax.set_title(f'On-Surface Points (Epoch {epoch})')
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    
-    # Plot 2: Off-surface points colored by signed distance
-    ax = axes[1]
-    scatter = ax.scatter(off_coords[:, 0], off_coords[:, 1], 
-                        c=off_sdf, cmap='RdBu_r', s=5, alpha=0.8,
-                        vmin=-0.5, vmax=0.5)
-    ax.set_xlim(-1.1, 1.1)
-    ax.set_ylim(-1.1, 1.1)
-    ax.set_xlabel('u')
-    ax.set_ylabel('v')
-    ax.set_title('Off-Surface Points (colored by SDF)')
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    plt.colorbar(scatter, ax=ax, label='Signed Distance')
-    
-    # Plot 3: Distance histogram
-    ax = axes[2]
-    ax.hist(off_dist, bins=50, alpha=0.7, color='blue')
-    ax.set_xlabel('Distance')
-    ax.set_ylabel('Count')
-    ax.set_title(f'Distance Distribution\nmean={off_dist.mean():.4f}, std={off_dist.std():.4f}')
-    ax.grid(True, alpha=0.3)
-    
-    plt.suptitle(f'REAL SDF - Epoch {epoch} (Batch {batch_idx})')
-    plt.tight_layout()
-    
-    filename = f'real_sdf_epoch_{epoch:04d}.png'
-    save_path = os.path.join(save_dir, filename)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # Also print stats
-    print(f"  REAL SDF stats - mean={off_sdf.mean():.4f}, std={off_sdf.std():.4f}, "
-          f"range=[{off_sdf.min():.4f}, {off_sdf.max():.4f}]")
+
+    if coords.shape[1] == 2:
+        # existing 2D plotting behaviour
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        # Plot 1: On-surface points (green)
+        ax = axes[0]
+        ax.scatter(on_coords[:, 0], on_coords[:, 1], 
+                   c='green', s=5, alpha=0.8, label=f'On-surface ({n_on})')
+        ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(-1.1, 1.1)
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_title(f'On-Surface Points (Epoch {epoch})')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        # Plot 2: Off-surface points colored by signed distance
+        ax = axes[1]
+        scatter = ax.scatter(off_coords[:, 0], off_coords[:, 1], 
+                            c=off_sdf, cmap='RdBu_r', s=5, alpha=0.8,
+                            vmin=-0.5, vmax=0.5)
+        ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(-1.1, 1.1)
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_title('Off-Surface Points (colored by SDF)')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        plt.colorbar(scatter, ax=ax, label='Signed Distance')
+        # Plot 3: Distance histogram
+        ax = axes[2]
+        ax.hist(off_dist, bins=50, alpha=0.7, color='blue')
+        ax.set_xlabel('Distance')
+        ax.set_ylabel('Count')
+        ax.set_title(f'Distance Distribution\nmean={off_dist.mean():.4f}, std={off_dist.std():.4f}')
+        ax.grid(True, alpha=0.3)
+        plt.suptitle(f'REAL SDF - Epoch {epoch} (Batch {batch_idx})')
+        plt.tight_layout()
+        filename = f'real_sdf_epoch_{epoch:04d}.png'
+        save_path = os.path.join(save_dir, filename)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # Also print stats
+        print(f"  REAL SDF stats - mean={off_sdf.mean():.4f}, std={off_sdf.std():.4f}, "
+              f"range=[{off_sdf.min():.4f}, {off_sdf.max():.4f}]")
+    elif coords.shape[1] == 3:
+        # build color array: black for on-surface, map off-surface by distance
+        colors = np.zeros((n_points, 3), dtype=np.uint8)
+        if len(off_dist) > 0:
+            # normalize distances for colormap
+            vmin = off_dist.min()
+            vmax = off_dist.max()
+            if np.isclose(vmin, vmax):
+                vmax = vmin + 1e-6
+            norm = plt.Normalize(vmin=vmin, vmax=vmax)
+            cmap = plt.cm.viridis
+            mapped = cmap(norm(off_dist))[:, :3]  # Nx3 floats
+            colors[n_on:] = (mapped * 255).astype(np.uint8)
+        # on-surface points remain black (0,0,0)
+        # write ply file
+        filename = f'real_sdf_epoch_{epoch:04d}_batch_{batch_idx:02d}.ply'
+        save_path = os.path.join(save_dir, filename)
+        with open(save_path, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {n_points}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for i in range(n_points):
+                x, y, z = coords[i]
+                r, g, b = colors[i]
+                f.write(f"{x} {y} {z} {r} {g} {b}\n")
+        print(f"  Saved 3D point cloud visualization to: {save_path}")
+    else:
+        raise ValueError(f"Unsupported coordinate dimension {coords.shape[1]} for visualization")
 
 # ==================== REAL SDF COMPUTATION FUNCTIONS ====================
 
@@ -817,8 +863,19 @@ class WaveSource(Dataset):
 
 
 class PointCloud(Dataset):
-    def __init__(self, pointcloud_path, on_surface_points, keep_aspect_ratio=True):
+    def __init__(self, pointcloud_path, on_surface_points, keep_aspect_ratio=True,
+                 use_signed_labels=False, k_neighbors=1,
+                 vis_sampled_point=False, vis_frequency=100, vis_dir=None):
         super().__init__()
+
+        # store options used by PointCloud2D for consistency
+        self.on_surface_points = on_surface_points
+        self.use_signed_labels = use_signed_labels
+        self.k_neighbors = k_neighbors
+        self.vis_sampled_point = vis_sampled_point
+        self.vis_frequency = vis_frequency
+        self.vis_dir = vis_dir
+        self.epoch_counter = 0
 
         print("Loading point cloud")
         point_cloud = np.genfromtxt(pointcloud_path)
@@ -840,7 +897,27 @@ class PointCloud(Dataset):
         self.coords -= 0.5
         self.coords *= 2.
 
-        self.on_surface_points = on_surface_points
+        # store full normalized dataset for knn queries
+        self.all_points_norm = self.coords.copy()
+        self.all_normals = self.normals.copy()
+
+        # prepare kNN if signed labels enabled
+        if self.use_signed_labels:
+            print(f"  REAL SDF ENABLED: preparing kNN (k={k_neighbors}) for distance computation...")
+            self.knn_model = NearestNeighbors(n_neighbors=k_neighbors)
+            self.knn_model.fit(self.all_points_norm)
+        else:
+            print(f"  REAL SDF DISABLED: using original -1 for all off-surface points")
+            self.knn_model = None
+
+        # visualization directory specified; do not create it yet.
+        # Directory will be created lazily when the first batch visualization is
+        # saved, but only if the parent experiment folder already exists (created by training.train()).
+        # This prevents early creation of the parent experiment folder,
+        # which would trigger an overwrite prompt later in `training.train`.
+        if self.vis_sampled_point and self.vis_dir:
+            mode_str = 'real_sdf' if use_signed_labels else 'original'
+            print(f"  Batch visualizations ({mode_str} mode) will be saved every {self.vis_frequency} epochs to: {self.vis_dir}")
 
     def __len__(self):
         return self.coords.shape[0] // self.on_surface_points
@@ -851,22 +928,65 @@ class PointCloud(Dataset):
         off_surface_samples = self.on_surface_points
         total_samples = self.on_surface_points + off_surface_samples
 
-        # Random coords
+        # Random subset of on-surface points for this batch
         rand_idcs = np.random.choice(point_cloud_size, size=self.on_surface_points)
-
         on_surface_coords = self.coords[rand_idcs, :]
         on_surface_normals = self.normals[rand_idcs, :]
 
+        # uniformly sample off-surface points
         off_surface_coords = np.random.uniform(-1, 1, size=(off_surface_samples, 3))
         off_surface_normals = np.ones((off_surface_samples, 3)) * -1
 
-        sdf = np.zeros((total_samples, 1))  # on-surface = 0
-        sdf[self.on_surface_points:, :] = -1  # off-surface = -1
+        # === compute real sdf if requested ===
+        if self.use_signed_labels:
+            sdf, sdf_on, sdf_off, distances = compute_real_sdf_values(
+                on_coords=on_surface_coords,
+                off_coords=off_surface_coords,
+                on_normals=self.all_normals,
+                use_signed_labels=True,
+                knn_model=self.knn_model,
+                on_points_norm=self.all_points_norm
+            )
+        else:
+            sdf_on = np.zeros(self.on_surface_points)
+            sdf_off = np.ones(off_surface_samples) * -1
+            sdf = np.concatenate([sdf_on, sdf_off])
+            distances = None
 
         coords = np.concatenate((on_surface_coords, off_surface_coords), axis=0)
         normals = np.concatenate((on_surface_normals, off_surface_normals), axis=0)
 
-        return {'coords': torch.from_numpy(coords).float()}, {'sdf': torch.from_numpy(sdf).float(),
+        # Visualization similar to 2D dataset; for 3D only save first and last
+        # batch of each epoch (controlled by vis_frequency on epoch count)
+        if self.vis_sampled_point and self.vis_dir and \
+           os.path.exists(os.path.dirname(self.vis_dir)) and \
+           (self.epoch_counter % self.vis_frequency == 0) and \
+           (idx == 0 or idx == len(self) - 1):
+            # check if batch_vis exists, if not create it
+            if not os.path.exists(self.vis_dir):
+                os.makedirs(self.vis_dir, exist_ok=True)
+            if self.use_signed_labels:
+                visualize_training_batch_real_sdf(
+                    coords=coords,
+                    gt_sdf=sdf.reshape(-1, 1),
+                    distances=distances,
+                    epoch=self.epoch_counter,
+                    save_dir=self.vis_dir,
+                    batch_idx=idx
+                )
+            else:
+                visualize_training_batch_original(
+                    coords=coords,
+                    gt_sdf=sdf.reshape(-1, 1),
+                    epoch=self.epoch_counter,
+                    save_dir=self.vis_dir,
+                    batch_idx=idx
+                )
+
+        if idx == 0:
+            self.epoch_counter += 1
+
+        return {'coords': torch.from_numpy(coords).float()}, {'sdf': torch.from_numpy(sdf).float().unsqueeze(-1),
                                                               'normals': torch.from_numpy(normals).float()}
 
 
@@ -1339,11 +1459,10 @@ class PointCloud2D(Dataset):
         # Print dataset info
         self._print_info()
         
-        # Visualization setup
+        # Visualization setup – Directory created lazily when first needed.
         if self.vis_sampled_point and self.vis_dir:
-            os.makedirs(self.vis_dir, exist_ok=True)
             mode_str = 'real_sdf' if use_signed_labels else 'original'
-            print(f"  Batch visualizations ({mode_str} mode) saved every {self.vis_frequency} epochs to: {self.vis_dir}")
+            print(f"  Batch visualizations ({mode_str} mode) will be saved every {self.vis_frequency} epochs to: {self.vis_dir}")
     
     def _load_data(self, pointcloud_path, plane_csv):
         """Load data based on whether plane_csv is provided."""
@@ -1456,9 +1575,13 @@ class PointCloud2D(Dataset):
         normals = np.vstack([on_normals, off_normals])
         
         # Visualization
-        if (self.vis_sampled_point and self.vis_dir and idx == 0 and 
+        if (self.vis_sampled_point and self.vis_dir and 
+            os.path.exists(os.path.dirname(self.vis_dir)) and 
+            idx == 0 and 
             self.epoch_counter % self.vis_frequency == 0):
-            
+            # check if batch_vis exists, if not create it
+            if not os.path.exists(self.vis_dir):
+                os.makedirs(self.vis_dir, exist_ok=True)
             if self.use_signed_labels:
                 visualize_training_batch_real_sdf(
                     coords=coords,

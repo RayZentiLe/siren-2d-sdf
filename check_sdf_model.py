@@ -13,6 +13,7 @@ from skimage import measure
 import warnings
 warnings.filterwarnings('ignore')
 
+
 # Optional mesh checks
 try:
     import trimesh
@@ -200,7 +201,240 @@ def random_points(n, span, dim=3):
     """Generate random points in [-span, span]^dim"""
     return np.random.uniform(-span, span, size=(n, dim)).astype(np.float32)
 
-# ------------------------ Verification Functions ---------------------------
+# ------------------------ NEW: Contour Visualization Functions ---------------------------
+
+def visualize_sdf_contours_2d(sdf_grid, x_grid, y_grid, output_path, 
+                               levels=20, highlight_zero=True):
+    """
+    Create comprehensive contour visualization of 2D SDF.
+    
+    Args:
+        sdf_grid: [N, N] array of SDF values
+        x_grid, y_grid: 1D arrays of coordinates
+        output_path: Path to save the figure
+        levels: Number of contour levels or specific levels list
+        highlight_zero: Whether to highlight the zero contour
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    extent = [x_grid.min(), x_grid.max(), y_grid.min(), y_grid.max()]
+    
+    # Plot 1: SDF heatmap
+    ax = axes[0, 0]
+    im = ax.imshow(sdf_grid.T, origin='lower', extent=extent,
+                   cmap='RdBu_r', vmin=-0.5, vmax=0.5)
+    ax.set_title('SDF Heatmap')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    plt.colorbar(im, ax=ax, label='SDF Value')
+    
+    # Plot 2: Contour lines only
+    ax = axes[0, 1]
+    contour = ax.contour(x_grid, y_grid, sdf_grid.T, levels=levels, 
+                         cmap='RdBu_r', linewidths=1)
+    ax.set_title(f'SDF Contour Lines ({levels} levels)')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_aspect('equal')
+    plt.colorbar(contour, ax=ax, label='SDF Value')
+    
+    # Plot 3: Zero level set (main contour)
+    ax = axes[0, 2]
+    if highlight_zero:
+        zero_contour = ax.contour(x_grid, y_grid, sdf_grid.T, levels=[0], 
+                                  colors='red', linewidths=2)
+        ax.set_title('Zero Level Set (SDF=0)')
+        # Add contour labels
+        if len(zero_contour.allsegs[0]) > 0:
+            ax.clabel(zero_contour, inline=True, fontsize=10, fmt='%.2f')
+    else:
+        ax.text(0.5, 0.5, 'No zero contour found', 
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('Zero Level Set')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 4: Combined heatmap + zero contour
+    ax = axes[1, 0]
+    im = ax.imshow(sdf_grid.T, origin='lower', extent=extent,
+                   cmap='RdBu_r', vmin=-0.5, vmax=0.5, alpha=0.8)
+    if highlight_zero:
+        ax.contour(x_grid, y_grid, sdf_grid.T, levels=[0], colors='black', linewidths=2)
+    ax.set_title('SDF Heatmap + Zero Contour')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    plt.colorbar(im, ax=ax, label='SDF Value')
+    
+    # Plot 5: Multiple important contours
+    ax = axes[1, 1]
+    important_levels = [-0.2, -0.1, 0, 0.1, 0.2]
+    contour = ax.contour(x_grid, y_grid, sdf_grid.T, levels=important_levels, 
+                        cmap='viridis', linewidths=1.5)
+    ax.set_title(f'Important Contours: {important_levels}')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_aspect('equal')
+    ax.clabel(contour, inline=True, fontsize=9, fmt='%.2f')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 6: Contour density (how close to zero)
+    ax = axes[1, 2]
+    # Compute distance to zero contour
+    from scipy.ndimage import distance_transform_edt
+    binary = sdf_grid < 0
+    dist_to_contour = distance_transform_edt(~binary) + distance_transform_edt(binary)
+    dist_to_contour = np.where(binary, -dist_to_contour, dist_to_contour)
+    
+    im = ax.imshow(dist_to_contour.T, origin='lower', extent=extent,
+                   cmap='RdBu_r', vmin=-0.2, vmax=0.2)
+    ax.contour(x_grid, y_grid, sdf_grid.T, levels=[0], colors='black', linewidths=1)
+    ax.set_title('Distance to Zero Contour')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    plt.colorbar(im, ax=ax, label='Signed Distance')
+    
+    plt.suptitle('2D SDF Contour Analysis', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved contour visualization to: {output_path}")
+
+
+def extract_and_save_zero_contour(sdf_grid, x_grid, y_grid, output_path):
+    """
+    Extract the zero level set and save as a separate plot.
+    Also return the contour points for further analysis.
+    """
+    # Extract zero level set using marching squares
+    contours = measure.find_contours(sdf_grid.T, level=0)
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Convert pixel coordinates to world coordinates
+    world_contours = []
+    for i, contour in enumerate(contours):
+        u_world = contour[:, 1] * (2.0 / (sdf_grid.shape[0] - 1)) - 1.0
+        v_world = contour[:, 0] * (2.0 / (sdf_grid.shape[1] - 1)) - 1.0
+        world_contour = np.stack([u_world, v_world], axis=1)
+        world_contours.append(world_contour)
+        
+        # Plot each contour with a different color
+        ax.plot(u_world, v_world, linewidth=2, label=f'Contour {i+1}' if i < 5 else '')
+    
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_title(f'Zero Level Set Contours (found {len(contours)} fragments)')
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    if len(contours) <= 5:
+        ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved zero contour to: {output_path}")
+    
+    return world_contours
+
+
+def compare_with_original_contour(sdf_grid, x_grid, y_grid, original_contour_points, 
+                                    output_path, model=None, device='cuda'):
+    """
+    Compare the model's zero contour with original contour points.
+    """
+    # Extract zero contour from SDF grid
+    contours = measure.find_contours(sdf_grid.T, level=0)
+    
+    if len(contours) == 0:
+        print("  Warning: No zero contour found in SDF grid")
+        return
+    
+    # Convert to world coordinates
+    world_contours = []
+    for contour in contours:
+        u_world = contour[:, 1] * (2.0 / (sdf_grid.shape[0] - 1)) - 1.0
+        v_world = contour[:, 0] * (2.0 / (sdf_grid.shape[1] - 1)) - 1.0
+        world_contours.append(np.stack([u_world, v_world], axis=1))
+    
+    all_contour_points = np.vstack(world_contours)
+    
+    # Compute distances from original points to nearest point on extracted contour
+    tree = KDTree(all_contour_points)
+    distances, _ = tree.query(original_contour_points)
+    
+    # Get SDF values at original points if model provided
+    if model is not None:
+        contour_tensor = torch.from_numpy(original_contour_points).float().to(device)
+        with torch.no_grad():
+            sdf_at_original = model(contour_tensor).cpu().numpy().flatten()
+    else:
+        sdf_at_original = None
+    
+    # Create comparison plot
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Plot 1: Original vs extracted contour
+    ax = axes[0]
+    ax.scatter(original_contour_points[:, 0], original_contour_points[:, 1], 
+               c='green', s=2, alpha=0.5, label='Original')
+    for wc in world_contours:
+        ax.plot(wc[:, 0], wc[:, 1], 'r-', linewidth=1, label='Extracted' if wc is world_contours[0] else '')
+    ax.set_title(f'Contour Comparison (mean dist={distances.mean():.4f})')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Plot 2: Distance error histogram
+    ax = axes[1]
+    ax.hist(distances, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    ax.axvline(distances.mean(), color='red', linestyle='--', label=f'Mean: {distances.mean():.4f}')
+    ax.axvline(np.median(distances), color='green', linestyle='--', label=f'Median: {np.median(distances):.4f}')
+    ax.set_xlabel('Distance to extracted contour')
+    ax.set_ylabel('Count')
+    ax.set_title('Distance Distribution')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 3: SDF values at original points (if available)
+    ax = axes[2]
+    if sdf_at_original is not None:
+        ax.scatter(original_contour_points[:, 0], original_contour_points[:, 1],
+                  c=sdf_at_original, cmap='RdBu_r', s=5, alpha=0.8,
+                  vmin=-0.1, vmax=0.1)
+        ax.set_title(f'SDF at Original Points (mean |val|={np.abs(sdf_at_original).mean():.4f})')
+        plt.colorbar(ax.collections[0], ax=ax, label='SDF Value')
+    else:
+        ax.text(0.5, 0.5, 'No model provided', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('SDF Values (unavailable)')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    
+    plt.suptitle('Contour Accuracy Analysis')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved contour comparison to: {output_path}")
+    
+    return {
+        'mean_distance': float(distances.mean()),
+        'median_distance': float(np.median(distances)),
+        'max_distance': float(distances.max()),
+        'std_distance': float(distances.std()),
+        'rmse': float(np.sqrt((distances**2).mean()))
+    }
+
+# ------------------------ Existing Verification Functions ---------------------------
 
 def check_basic_stats(decoder, n_points=200000, span=1.0, device="cuda", dim=3):
     """Basic statistics of SDF values on random points"""
@@ -700,16 +934,50 @@ def main():
     
     # 3) Grid sampling and visualization
     print("\n[2] Sampling on grid...")
+    
     if args.dim == 2:
         # 2D grid
         G, x_grid, y_grid = sample_sdf_grid_2d(model, N=args.grid, max_batch=args.max_batch, 
                                                 device=device, span=args.span)
         g_flat = G.reshape(-1)
         
-        # Save 2D visualization
+        # Save basic 2D visualization
         save_2d_sdf_plot(G, x_grid, y_grid, f"2D SDF Grid (N={args.grid})",
                          os.path.join(args.outdir, "sdf_2d_grid.png"))
         
+        # ===== NEW: Enhanced contour visualization =====
+        print("\n[3] Creating enhanced contour visualizations...")
+        
+        # Comprehensive contour plot
+        visualize_sdf_contours_2d(
+            G, x_grid, y_grid,
+            os.path.join(args.outdir, "sdf_contour_analysis.png"),
+            levels=20, highlight_zero=True
+        )
+        
+        # Extract and save zero contour separately
+        world_contours = extract_and_save_zero_contour(
+            G, x_grid, y_grid,
+            os.path.join(args.outdir, "zero_contour.png")
+        )
+        
+        # If contour file provided, compare with original
+        if args.contour_file:
+            print("\n[4] Comparing with original contour points...")
+            contour_points = np.loadtxt(args.contour_file, delimiter=",", skiprows=1)
+            if contour_points.ndim == 1:
+                contour_points = contour_points.reshape(-1, 2)
+            
+            contour_metrics = compare_with_original_contour(
+                G, x_grid, y_grid, contour_points,
+                os.path.join(args.outdir, "contour_comparison.png"),
+                model=model, device=device
+            )
+            
+            if contour_metrics:
+                report["contour_comparison"] = contour_metrics
+        
+        # Continue with existing 2D checks
         report["grid_stats"] = {
             "dim": 2,
             "grid_N": int(args.grid),
@@ -723,9 +991,9 @@ def main():
         save_hist(g_flat, f"Field values on grid N={args.grid} (2D)", "f(x)", 
                   os.path.join(args.outdir, "hist_grid_values.png"))
         
-        # 4) Contour accuracy check (if contour file provided)
+        # Contour accuracy check (existing)
         if args.contour_file:
-            print("\n[3] Checking contour accuracy...")
+            print("\n[5] Checking contour accuracy (existing)...")
             contour_points = np.loadtxt(args.contour_file, delimiter=",", skiprows=1)
             if contour_points.ndim == 1:
                 contour_points = contour_points.reshape(-1, 2)
@@ -733,16 +1001,16 @@ def main():
                 model, contour_points, device=device, resolution=args.grid, outdir=args.outdir
             )
         
-        # 5) Eikonal error map
-        print("\n[4] Computing Eikonal error map...")
+        # Eikonal error map
+        print("\n[6] Computing Eikonal error map...")
         report["eikonal_stats"] = eikonal_error_map(model, resolution=100, device=device, outdir=args.outdir)
         
-        # 6) Gradient field visualization
-        print("\n[5] Visualizing gradient field...")
+        # Gradient field visualization
+        print("\n[7] Visualizing gradient field...")
         report["gradient_stats"] = visualize_gradient_field(model, resolution=30, device=device, outdir=args.outdir)
         
-        # 7) SDF profiles in different directions
-        print("\n[6] Plotting SDF profiles...")
+        # SDF profiles
+        print("\n[8] Plotting SDF profiles...")
         directions = [
             ([-0.8, -0.8], [0.8, 0.8]),  # diagonal
             ([-0.8, 0.0], [0.8, 0.0]),    # horizontal
@@ -755,15 +1023,15 @@ def main():
                                        outdir=args.outdir, prefix=prefix)
             report.update(results)
         
-        # 8) Sign consistency check
+        # Sign consistency check
         if args.contour_file:
-            print("\n[7] Checking sign consistency...")
+            print("\n[9] Checking sign consistency...")
             report["sign_consistency"] = check_sign_consistency_2d(
                 model, contour_points, num_random=args.rand//2, device=device, outdir=args.outdir
             )
         
-        # 9) Gradient norm stats (Eikonal)
-        print("\n[8] Computing gradient norm statistics...")
+        # Gradient norm stats
+        print("\n[10] Computing gradient norm statistics...")
         grad_stats, norms = grad_norm_stats(model, n=args.grad, span=args.span, 
                                             device=device, dim=args.dim)
         report["eikonal_grad_norm"] = grad_stats
@@ -772,7 +1040,7 @@ def main():
                       os.path.join(args.outdir, "hist_grad_norms.png"))
     
     else:
-        # 3D mode (original)
+        # 3D mode (original, unchanged)
         G, xC, yC, zC = sample_sdf_grid_3d(model, N=min(args.grid, 128), 
                                             max_batch=args.max_batch, device=device)
         g_flat = G.reshape(-1)
@@ -867,23 +1135,11 @@ def main():
             ca = report['contour_accuracy']
             print(f"  Mean distance to contour: {ca.get('mean_distance_to_contour', 'N/A')}")
             print(f"  Mean |SDF| at contour: {ca.get('mean_abs_sdf_at_contour', 'N/A')}")
+        if 'contour_comparison' in report:
+            cc = report['contour_comparison']
+            print(f"  Contour comparison RMSE: {cc.get('rmse', 'N/A')}")
     if 'eikonal_grad_norm' in report and 'mean_abs_error_from_1' in report['eikonal_grad_norm']:
         print(f"  Eikonal error: {report['eikonal_grad_norm']['mean_abs_error_from_1']:.4f}")
-    if args.dim == 2:
-    # 2D grid - use span=1.0 for normalized coordinates
-        print(f"\n[2] Sampling on {args.grid}x{args.grid} grid in [-1, 1]²...")
-        G, x_grid, y_grid = sample_sdf_grid_2d(
-            model, 
-            N=args.grid, 
-            max_batch=args.max_batch, 
-            device=device, 
-            span=1.0  # Force span=1.0 for normalized space
-        )
-        
-        # Random points - use args.span (default 1.0)
-        print(f"\n[1] Sampling {args.rand} random points in [-{args.span}, {args.span}]²...")
-        P = random_points(args.rand, args.span, dim=2)
-        V = batched_eval(model, P, device)
 
 if __name__ == "__main__":
     main()
