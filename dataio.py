@@ -3,6 +3,12 @@ import glob
 import math
 import os
 
+# Fix for headless matplotlib
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 import matplotlib.colors as colors
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -15,6 +21,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import Resize, Compose, ToTensor, Normalize
+from sklearn.neighbors import NearestNeighbors  # For signed labeling
 
 
 def get_mgrid(sidelen, dim=2):
@@ -110,28 +117,325 @@ def gaussian(x, mu=[0, 0], sigma=1e-4, d=2):
     return torch.from_numpy(1 / np.sqrt(sigma ** d * (2 * np.pi) ** d) * np.exp(q / sigma)).float()
 
 
-class InverseHelmholtz(Dataset):
-    def __init__(self, source_coords, rec_coords, rec_val, sidelength, velocity='uniform', pretrain=False):
+# ==================== 2D SDF HELPER FUNCTIONS ====================
 
+def transform_plane_to_xy(points_3d, normals_3d, plane_origin, plane_normal):
+    """
+    Transform points and normals so that the given plane becomes the XY plane.
+    
+    Args:
+        points_3d: [N, 3] points exactly on the plane (from cross-section)
+        normals_3d: [N, 3] normals at these points
+        plane_origin: [3] point on the plane
+        plane_normal: [3] normal vector of the plane
+    
+    Returns:
+        points_2d: [N, 2] points in XY plane coordinates
+        normals_2d: [N, 2] normals projected onto XY plane
+        transform_info: dict with rotation matrix and origin
+    """
+    # 1. Shift to plane origin
+    points_shifted = points_3d - plane_origin
+    
+    # 2. Build rotation matrix to align plane_normal with [0, 0, 1]
+    z_axis = plane_normal / np.linalg.norm(plane_normal)
+    
+    # Find arbitrary perpendicular vectors for x and y axes
+    if abs(z_axis[0]) < 0.9:
+        x_axis = np.cross(z_axis, [1, 0, 0])
+    else:
+        x_axis = np.cross(z_axis, [0, 1, 0])
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / np.linalg.norm(y_axis)
+    
+    # Rotation matrix (points @ R rotates them to align with axes)
+    R = np.vstack([x_axis, y_axis, z_axis]).T
+    
+    # 3. Apply rotation to points
+    points_rotated = points_shifted @ R
+    
+    # 4. Points should now have z ≈ 0 (they were exactly on the plane)
+    points_2d = points_rotated[:, :2]  # Drop z, keep x,y
+    
+    # 5. Transform normals (vectors need same rotation)
+    normals_rotated = normals_3d @ R
+    
+    # 6. Project normals onto XY plane (drop z component) and renormalize
+    normals_2d = normals_rotated[:, :2]
+    norm_norms = np.linalg.norm(normals_2d, axis=1, keepdims=True)
+    normals_2d = normals_2d / (norm_norms + 1e-8)
+    
+    transform_info = {
+        'rotation_matrix': R,
+        'plane_origin': plane_origin,
+        'x_axis': x_axis,
+        'y_axis': y_axis,
+        'z_axis': z_axis
+    }
+    
+    return points_2d, normals_2d, transform_info
+
+
+def normalize_to_unit_square(points_2d):
+    """
+    Normalize 2D points to [-1, 1] range.
+    """
+    # Center points
+    mean = np.mean(points_2d, axis=0, keepdims=True)
+    points_centered = points_2d - mean
+    
+    # Find scale to fit in [-1, 1]
+    max_abs = np.amax(np.abs(points_centered))
+    if max_abs < 1e-6:
+        max_abs = 1.0
+    
+    scale = max_abs
+    points_norm = points_centered / scale
+    
+    norm_params = {
+        'mean': mean.flatten(),
+        'scale': scale
+    }
+    
+    return points_norm, norm_params
+
+
+def load_point_cloud_with_normals(file_path):
+    """Load .xyz file with normals (x y z nx ny nz)"""
+    data = np.loadtxt(file_path)
+    points = data[:, :3]
+    normals = data[:, 3:6]
+    return points, normals
+
+
+def load_plane_csv(plane_csv):
+    """Load plane parameters from CSV file."""
+    plane_params = np.loadtxt(plane_csv, delimiter=",", skiprows=1)
+    if plane_params.ndim == 1:
+        plane_params = plane_params.reshape(1, -1)
+    
+    plane_origin = plane_params[0, :3]
+    plane_normal = plane_params[0, 3:6]
+    
+    return plane_origin, plane_normal
+
+
+def write_sdf_summary_2d(model, model_input, gt, model_output, writer, total_steps, prefix='train_'):
+    """
+    Write summary for 2D SDF training.
+    """
+    # Get data and ensure proper shapes
+    pred_sdf = model_output['model_out'].detach().cpu().numpy()  # Shape: [batch_size*2, 1]
+    gt_sdf = gt['sdf'].detach().cpu().numpy()  # Shape: [batch_size*2, 1]
+    coords = model_input['coords'].detach().cpu().numpy()  # Shape: [batch_size*2, 2]
+    
+    # Flatten everything to 1D for indexing
+    pred_sdf_flat = pred_sdf.flatten()
+    gt_sdf_flat = gt_sdf.flatten()
+    
+    # Create mask for on-surface points (using small tolerance around 0)
+    on_surface_mask = np.abs(gt_sdf_flat) < 1e-6
+    
+    # Filter points
+    on_coords = coords[on_surface_mask]
+    on_pred = pred_sdf_flat[on_surface_mask]
+    
+    print(f"Summary - Total points: {len(coords)}, On-surface: {len(on_coords)}")
+    
+    # Create 2D grid for visualization
+    resolution = 256
+    u_grid = np.linspace(-1, 1, resolution)
+    v_grid = np.linspace(-1, 1, resolution)
+    uu, vv = np.meshgrid(u_grid, v_grid)
+    grid_coords = np.stack([uu.ravel(), vv.ravel()], axis=1)
+    
+    # Evaluate model on grid
+    grid_tensor = torch.from_numpy(grid_coords).float().cuda()
+    grid_input = {'coords': grid_tensor}
+    
+    with torch.no_grad():
+        grid_output = model(grid_input)
+        grid_sdf = grid_output['model_out'].cpu().numpy().reshape(resolution, resolution)
+    
+    # Create figure
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Plot 1: On-surface training points colored by predicted SDF
+    ax = axes[0]
+    if len(on_coords) > 0:
+        scatter = ax.scatter(on_coords[:, 0], on_coords[:, 1], c=on_pred, 
+                            cmap='RdBu_r', s=5, alpha=0.8, vmin=-0.5, vmax=0.5)
+        ax.set_title(f'On-Surface Points (n={len(on_coords)})')
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes('right', size='5%', pad=0.05)
+        plt.colorbar(scatter, cax=cax)
+    else:
+        ax.set_title('On-Surface Points (none)')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 2: Predicted SDF on grid
+    ax = axes[1]
+    im = ax.imshow(grid_sdf.T, origin='lower', extent=[-1, 1, -1, 1],
+                   cmap='RdBu_r', vmin=-0.5, vmax=0.5)
+    ax.set_title('Predicted SDF on Grid')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_aspect('equal')
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes('right', size='5%', pad=0.05)
+    plt.colorbar(im, cax=cax)
+    
+    # Plot 3: Zero level set with original points
+    ax = axes[2]
+    ax.contour(grid_sdf.T, levels=[0], colors='black', linewidths=1, extent=[-1, 1, -1, 1])
+    if len(on_coords) > 0:
+        ax.scatter(on_coords[:, 0], on_coords[:, 1], c='red', s=5, alpha=0.5, label='Contour Points')
+        ax.legend()
+    ax.set_title('Zero Level Set')
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save to tensorboard
+    writer.add_figure(prefix + 'sdf_2d', fig, global_step=total_steps)
+    plt.close(fig)
+    
+    # Also log losses
+    if 'loss' in model_output:
+        writer.add_scalar(prefix + 'total_loss', model_output['loss'].item(), total_steps)
+    
+    for key in ['sdf', 'inter', 'normal_constraint', 'grad_constraint']:
+        if key in model_output:
+            writer.add_scalar(prefix + key, model_output[key].item(), total_steps)
+
+
+# ==================== VISUALIZATION FUNCTIONS ====================
+
+def visualize_training_batch_original(coords, gt_sdf, epoch, save_dir, batch_idx=0):
+    """
+    Original visualization: off-surface (red), on-surface (green)
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    gt_sdf_flat = gt_sdf.flatten()
+    on_surface = gt_sdf_flat != -1
+    off_surface = gt_sdf_flat == -1
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    if off_surface.any():
+        ax.scatter(coords[off_surface, 0], coords[off_surface, 1], 
+                  c='red', s=2, alpha=0.3, label=f'Off-surface ({off_surface.sum()})')
+    
+    if on_surface.any():
+        ax.scatter(coords[on_surface, 0], coords[on_surface, 1], 
+                  c='green', s=5, alpha=0.8, label=f'On-surface ({on_surface.sum()})')
+    
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_title(f'Training Batch (Original) - Epoch {epoch} (Batch {batch_idx})')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right')
+    
+    stats_text = f'Total: {len(coords)}\nOn: {on_surface.sum()}\nOff: {off_surface.sum()}'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    filename = f'training_batch_epoch_{epoch:04d}.png'
+    save_path = os.path.join(save_dir, filename)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Saved batch visualization to: {save_path}")
+
+
+def visualize_training_batch_signed(coords, gt_sdf, epoch, save_dir, batch_idx=0):
+    """
+    Signed visualization: inside (blue), on-surface (green), outside (red)
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    gt_sdf_flat = gt_sdf.flatten()
+    
+    on_surface = np.abs(gt_sdf_flat) < 1e-6
+    outside = gt_sdf_flat > 0.5
+    inside = gt_sdf_flat < -0.5
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    if outside.any():
+        ax.scatter(coords[outside, 0], coords[outside, 1], 
+                  c='red', s=2, alpha=0.3, label=f'Outside (+1) ({outside.sum()})')
+    
+    if inside.any():
+        ax.scatter(coords[inside, 0], coords[inside, 1], 
+                  c='blue', s=2, alpha=0.3, label=f'Inside (-1) ({inside.sum()})')
+    
+    if on_surface.any():
+        ax.scatter(coords[on_surface, 0], coords[on_surface, 1], 
+                  c='green', s=5, alpha=0.8, label=f'On-surface (0) ({on_surface.sum()})')
+    
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_xlabel('u')
+    ax.set_ylabel('v')
+    ax.set_title(f'Training Batch (Signed) - Epoch {epoch} (Batch {batch_idx})')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right')
+    
+    stats_text = f'Total: {len(coords)}\nOn: {on_surface.sum()}\nOut: {outside.sum()}\nIn: {inside.sum()}'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    filename = f'training_batch_epoch_{epoch:04d}.png'
+    save_path = os.path.join(save_dir, filename)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Saved signed batch visualization to: {save_path}")
+
+
+# ==================== ORIGINAL DATASET CLASSES ====================
+
+class InverseHelmholtz(Dataset):
+    # ... (keep the original class as is) ...
+    def __init__(self, source_coords, rec_coords, rec_val, sidelength, velocity='uniform', pretrain=False):
         super().__init__()
         torch.manual_seed(0)
-
         self.sidelength = sidelength
         self.mgrid = get_mgrid(self.sidelength).detach()
         self.velocity = velocity
         self.wavenumber = 20.
         self.pretrain = pretrain
-
-        self.N_src_samples = 100  # how many times to sample around each small gaussian source
+        self.N_src_samples = 100
         self.sigma = 1e-4
         self.source = torch.Tensor([1.0, 1.0]).view(-1, 2)
-        self.source_coords = torch.Tensor(source_coords).float()  # Nsrc, 2
-
-        self.rec_coords = torch.Tensor(rec_coords).float()  # Nrec, 2
-        self.rec = torch.zeros(self.rec_coords.shape[0], 2 * self.source_coords.shape[0])  # Nrec, 2*Nsrc
+        self.source_coords = torch.Tensor(source_coords).float()
+        self.rec_coords = torch.Tensor(rec_coords).float()
+        self.rec = torch.zeros(self.rec_coords.shape[0], 2 * self.source_coords.shape[0])
         for i in range(self.rec.shape[0]):
-            self.rec[i, ::2] = torch.Tensor(rec_val.real)[i, :].float()  # * amplitude
-            self.rec[i, 1::2] = torch.Tensor(rec_val.imag)[i, :].float()  # * amplitude
+            self.rec[i, ::2] = torch.Tensor(rec_val.real)[i, :].float()
+            self.rec[i, 1::2] = torch.Tensor(rec_val.imag)[i, :].float()
 
     def __len__(self):
         return 1
@@ -152,54 +456,37 @@ class InverseHelmholtz(Dataset):
         else:
             squared_slowness = torch.ones_like(coords)
             squared_slowness[..., 1] = 0.
-
         return squared_slowness
 
     def __getitem__(self, idx):
-
-        N_src_coords = self.source_coords.shape[0]  # number of sources
+        N_src_coords = self.source_coords.shape[0]
         N_rec_coords = self.rec_coords.shape[0]
         coords = torch.zeros(self.sidelength ** 2, 2).uniform_(-1., 1.)
-
         samp_source_coords = torch.zeros(self.N_src_samples * N_src_coords, 2)
         for i in range(N_src_coords):
             samp_source_coords_r = 5e2 * self.sigma * torch.rand(self.N_src_samples, 1).sqrt()
             samp_source_coords_theta = 2 * np.pi * torch.rand(self.N_src_samples, 1)
-            samp_source_coords_x = samp_source_coords_r * torch.cos(samp_source_coords_theta) \
-                                   + self.source_coords[i, 0]
-            samp_source_coords_y = samp_source_coords_r * torch.sin(samp_source_coords_theta) \
-                                   + self.source_coords[i, 1]
+            samp_source_coords_x = samp_source_coords_r * torch.cos(samp_source_coords_theta) + self.source_coords[i, 0]
+            samp_source_coords_y = samp_source_coords_r * torch.sin(samp_source_coords_theta) + self.source_coords[i, 1]
             samp_source_coords[i * self.N_src_samples:(i + 1) * self.N_src_samples, :] = \
                 torch.cat((samp_source_coords_x, samp_source_coords_y), dim=1)
-
-        # Always include coordinates where source is nonzero
         coords[-self.N_src_samples * N_src_coords:, :] = samp_source_coords
         coords[:N_rec_coords, :] = self.rec_coords
-
-        # sample each of the source gaussians separately 
         source_boundary_values = torch.zeros(coords.shape[0], 2 * N_src_coords)
         for i in range(N_src_coords):
             source_boundary_values[:, 2 * i:2 * i + 2] = self.source * \
                                                          gaussian(coords, mu=self.source_coords[i, :],
                                                                   sigma=self.sigma)[:, None]
-
-        # truncate the source gaussians
         source_boundary_values[source_boundary_values < 1e-5] = 0.
-
-        # add the receiver dirichlet conditions 
         rec_boundary_values = torch.zeros(coords.shape[0], self.rec.shape[1])
         rec_boundary_values[:N_rec_coords:, :] = self.rec
-
-        # we don't know the squared slowness for the inverse problem
         squared_slowness = torch.Tensor([-1.])
         squared_slowness_grid = torch.Tensor([-1.])
         pretrain = torch.Tensor([-1.])
-
         if self.pretrain:
             squared_slowness = self.get_squared_slowness(coords)
             squared_slowness_grid = self.get_squared_slowness(self.mgrid)[:, 0, None]
             pretrain = torch.Tensor([1.])
-
         return {'coords': coords}, {'source_boundary_values': source_boundary_values,
                                     'rec_boundary_values': rec_boundary_values, 'squared_slowness': squared_slowness,
                                     'squared_slowness_grid': squared_slowness_grid, 'wavenumber': self.wavenumber,
@@ -207,26 +494,21 @@ class InverseHelmholtz(Dataset):
 
 
 class SingleHelmholtzSource(Dataset):
+    # ... (keep the original class as is) ...
     def __init__(self, sidelength, velocity='uniform', source_coords=[0., 0.]):
         super().__init__()
         torch.manual_seed(0)
-
         self.sidelength = sidelength
         self.mgrid = get_mgrid(self.sidelength).detach()
         self.velocity = velocity
         self.wavenumber = 20.
-
         self.N_src_samples = 100
         self.sigma = 1e-4
         self.source = torch.Tensor([1.0, 1.0]).view(-1, 2)
         self.source_coords = torch.tensor(source_coords).view(-1, 2)
-
-        # For reference: this derives the closed-form solution for the inhomogenous Helmholtz equation.
         square_meshgrid = lin2img(self.mgrid[None, ...]).numpy()
         x = square_meshgrid[0, 0, ...]
         y = square_meshgrid[0, 1, ...]
-
-        # Specify the source.
         source_np = self.source.numpy()
         hx = hy = 2 / self.sidelength
         field = np.zeros((sidelength, sidelength)).astype(np.complex64)
@@ -234,10 +516,8 @@ class SingleHelmholtzSource(Dataset):
             x0 = self.source_coords[i, 0].numpy()
             y0 = self.source_coords[i, 1].numpy()
             s = source_np[i, 0] + 1j * source_np[i, 1]
-
             hankel = scipy.special.hankel2(0, self.wavenumber * np.sqrt((x - x0) ** 2 + (y - y0) ** 2) + 1e-6)
             field += 0.25j * hankel * s * hx * hy
-
         field_r = torch.from_numpy(np.real(field).reshape(-1, 1))
         field_i = torch.from_numpy(np.imag(field).reshape(-1, 1))
         self.field = torch.cat((field_r, field_i), dim=1)
@@ -258,33 +538,23 @@ class SingleHelmholtzSource(Dataset):
             mask = (torch.sqrt(coords[..., 0] ** 2 + coords[..., 1] ** 2) < 0.1)
             squared_slowness[..., 0] = torch.where(mask, 1. / perturbation ** 2 * torch.ones_like(mask.float()),
                                                    torch.ones_like(mask.float()))
-
         else:
             squared_slowness = torch.ones_like(coords)
             squared_slowness[..., 1] = 0.
-
         return squared_slowness
 
     def __getitem__(self, idx):
-        # indicate where border values are
         coords = torch.zeros(self.sidelength ** 2, 2).uniform_(-1., 1.)
         source_coords_r = 5e2 * self.sigma * torch.rand(self.N_src_samples, 1).sqrt()
         source_coords_theta = 2 * np.pi * torch.rand(self.N_src_samples, 1)
         source_coords_x = source_coords_r * torch.cos(source_coords_theta) + self.source_coords[0, 0]
         source_coords_y = source_coords_r * torch.sin(source_coords_theta) + self.source_coords[0, 1]
         source_coords = torch.cat((source_coords_x, source_coords_y), dim=1)
-
-        # Always include coordinates where source is nonzero
         coords[-self.N_src_samples:, :] = source_coords
-
-        # We use the value "zero" to encode "no boundary constraint at this coordinate"
         boundary_values = self.source * gaussian(coords, mu=self.source_coords, sigma=self.sigma)[:, None]
         boundary_values[boundary_values < 1e-5] = 0.
-
-        # specify squared slowness
         squared_slowness = self.get_squared_slowness(coords)
         squared_slowness_grid = self.get_squared_slowness(self.mgrid)[:, 0, None]
-
         return {'coords': coords}, {'source_boundary_values': boundary_values, 'gt': self.field,
                                     'squared_slowness': squared_slowness,
                                     'squared_slowness_grid': squared_slowness_grid,
@@ -292,20 +562,17 @@ class SingleHelmholtzSource(Dataset):
 
 
 class WaveSource(Dataset):
-    def __init__(self, sidelength, velocity='uniform', source_coords=[0., 0., 0.],
-                 pretrain=False):
+    # ... (keep the original class as is) ...
+    def __init__(self, sidelength, velocity='uniform', source_coords=[0., 0., 0.], pretrain=False):
         super().__init__()
         torch.manual_seed(0)
-
         self.pretrain = pretrain
         self.sidelength = sidelength
         self.mgrid = get_mgrid(self.sidelength).detach()
         self.velocity = velocity
-
         self.N_src_samples = 1000
         self.sigma = 5e-4
         self.source_coords = torch.tensor(source_coords).view(-1, 3)
-
         self.counter = 0
         self.full_count = 100e3
 
@@ -330,59 +597,37 @@ class WaveSource(Dataset):
         return squared_slowness
 
     def __getitem__(self, idx):
-        start_time = self.source_coords[0, 0]  # time to apply  initial conditions
-
+        start_time = self.source_coords[0, 0]
         r = 5e2 * self.sigma * torch.rand(self.N_src_samples, 1).sqrt()
         phi = 2 * np.pi * torch.rand(self.N_src_samples, 1)
-
-        # circular sampling
         source_coords_x = r * torch.cos(phi) + self.source_coords[0, 1]
         source_coords_y = r * torch.sin(phi) + self.source_coords[0, 2]
         source_coords = torch.cat((source_coords_x, source_coords_y), dim=1)
-
-        # uniformly sample domain and include coordinates where source is non-zero 
         coords = torch.zeros(self.sidelength ** 2, 2).uniform_(-1, 1)
-
         if self.pretrain:
-            # only sample in time around the initial condition
             time = torch.zeros(self.sidelength ** 2, 1).uniform_(start_time - 0.001, start_time + 0.001)
             coords = torch.cat((time, coords), dim=1)
-            # make sure we spatially sample the source
             coords[-self.N_src_samples:, 1:] = source_coords
         else:
-            # slowly grow time values from start time
-            # this currently assumes start_time = 0 and max time value is 0.75. 
             time = torch.zeros(self.sidelength ** 2, 1).uniform_(0, 0.4 * (self.counter / self.full_count))
             coords = torch.cat((time, coords), dim=1)
-
-            # make sure we always have training samples at the initial condition
             coords[-self.N_src_samples:, 1:] = source_coords
             coords[-2 * self.N_src_samples:, 0] = start_time
-
-            # set up source
         normalize = 50 * gaussian(torch.zeros(1, 2), mu=torch.zeros(1, 2), sigma=self.sigma, d=2)
         boundary_values = gaussian(coords[:, 1:], mu=self.source_coords[:, 1:], sigma=self.sigma, d=2)[:, None]
         boundary_values /= normalize
-
         if self.pretrain:
             dirichlet_mask = torch.ones(coords.shape[0], 1) > 0
         else:
-            # only enforce initial conditions around start_time
             boundary_values = torch.where((coords[:, 0, None] == start_time), boundary_values, torch.Tensor([0]))
             dirichlet_mask = (coords[:, 0, None] == start_time)
-
         boundary_values[boundary_values < 1e-5] = 0.
-
-        # specify squared slowness
         squared_slowness = self.get_squared_slowness(coords)[:, None]
         squared_slowness_grid = self.get_squared_slowness(self.mgrid)[:, None]
-
         self.counter += 1
-
         if self.pretrain and self.counter == 2000:
             self.pretrain = False
             self.counter = 0
-
         return {'coords': coords}, {'source_boundary_values': boundary_values, 'dirichlet_mask': dirichlet_mask,
                                     'squared_slowness': squared_slowness, 'squared_slowness_grid': squared_slowness_grid}
 
@@ -398,8 +643,7 @@ class PointCloud(Dataset):
         coords = point_cloud[:, :3]
         self.normals = point_cloud[:, 3:]
 
-        # Reshape point cloud such that it lies in bounding box of (-1, 1) (distorts geometry, but makes for high
-        # sample efficiency)
+        # Reshape point cloud such that it lies in bounding box of (-1, 1)
         coords -= np.mean(coords, axis=0, keepdims=True)
         if keep_aspect_ratio:
             coord_max = np.amax(coords)
@@ -420,7 +664,7 @@ class PointCloud(Dataset):
     def __getitem__(self, idx):
         point_cloud_size = self.coords.shape[0]
 
-        off_surface_samples = self.on_surface_points  # **2
+        off_surface_samples = self.on_surface_points
         total_samples = self.on_surface_points + off_surface_samples
 
         # Random coords
@@ -496,7 +740,6 @@ class ImageFile(Dataset):
 
 class CelebA(Dataset):
     def __init__(self, split, downsampled=False):
-        # SIZE (178 x 218)
         super().__init__()
         assert split in ['train', 'test', 'val'], "Unknown split"
 
@@ -523,7 +766,7 @@ class CelebA(Dataset):
         path = os.path.join(self.root, self.fnames[idx])
         img = Image.open(path)
         if self.downsampled:
-            width, height = img.size  # Get dimensions
+            width, height = img.size
 
             s = min(width, height)
             left = (width - s) / 2
@@ -685,13 +928,10 @@ class ImageGeneralizationWrapper(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.dataset)
 
-    # update the sparsity of the images used in testing
     def update_test_sparsity(self, test_sparsity):
         self.test_sparsity = test_sparsity
 
-    # generate the input dictionary based on the type of model used for generalization
     def get_generalization_in_dict(self, spatial_img, img, idx):
-        # case where we use the convolutional encoder for generalization, either testing or training
         if self.generalization_mode == 'conv_cnp' or self.generalization_mode == 'conv_cnp_test':
             if self.test_sparsity == 'full':
                 img_sparse = spatial_img
@@ -708,7 +948,6 @@ class ImageGeneralizationWrapper(torch.utils.data.Dataset):
                     1, spatial_img.size(1), spatial_img.size(2)).bernoulli_(p=num_context / np.prod(self.sidelength))
                 img_sparse = mask * spatial_img
             in_dict = {'idx': idx, 'coords': self.mgrid, 'img_sparse': img_sparse}
-        # case where we use the set encoder for generalization, either testing or training
         elif self.generalization_mode == 'cnp' or self.generalization_mode == 'cnp_test':
             if self.test_sparsity == 'full':
                 in_dict = {'idx': idx, 'coords': self.mgrid, 'img_sub': img, 'coords_sub': self.mgrid}
@@ -744,16 +983,11 @@ class ImageGeneralizationWrapper(torch.utils.data.Dataset):
         return in_dict, gt_dict
 
 
-
-# in_folder: where to find the data (train, val, test)
-# color: whether to load in color
-# idx_to_sample: which index to sample (usefull if wanting to fit a single image)
-# preload: whether or not to preload in memory
 class BSD500ImageDataset(Dataset):
     def __init__(self,
                  in_folder='data/BSD500/train',
                  is_color=False,
-                 size=[321, 321],  # BSD is 481x321
+                 size=[321, 321],
                  preload=True,
                  idx_to_sample=[]):
         self.in_folder = in_folder
@@ -769,11 +1003,9 @@ class BSD500ImageDataset(Dataset):
         self.img_filenames = []
         self.img_preloaded = []
         for idx, filename in enumerate(sorted(glob.glob(self.in_folder + '/*.jpg'))):
-            # print(f'Gathering img #{idx}')
             self.img_filenames.append(filename)
 
             if (self.preload):
-                # print(f'... preloaded')
                 img = self.load_image(filename)
                 self.img_preloaded.append(img)
 
@@ -789,19 +1021,12 @@ class BSD500ImageDataset(Dataset):
         return img
 
     def __len__(self):
-        # If we have specified specific idx to sample from, we only
-        # return from those, otherwise, we want to return from the whole
-        # dataset
         if (len(self.idx_to_sample) != 0):
             return len(self.idx_to_sample)
         else:
             return len(self.img_filenames)
 
     def __getitem__(self, item):
-        # if we have specified specific idx to sample from, convert
-        # back the item number to the actual item we can sample from,
-        # otherwise you can directly use the item since the length
-        # corresponds to all the files in the directory.
         if (len(self.idx_to_sample) != 0):
             idx = self.idx_to_sample[item]
         else:
@@ -887,3 +1112,291 @@ class CompositeGradients(Dataset):
                    'gradients': self.comp_grads}
 
         return in_dict, gt_dict
+
+
+# ==================== 2D SDF DATASET CLASSES ====================
+class PointCloud2D(Dataset):
+    """
+    Unified dataset for 2D SDF training.
+    
+    Handles two cases automatically:
+    1. If plane_csv is provided: Transforms 3D cross-section to 2D
+    2. If plane_csv is None: Assumes data is already in 2D format (x, y, nx, ny)
+    """
+    
+    def __init__(self, pointcloud_path, on_surface_points, 
+                 plane_csv=None,
+                 use_signed_labels=False, k_neighbors=16,
+                 vis_sampled_point=False, vis_frequency=100, vis_dir=None):
+        """
+        Args:
+            pointcloud_path: Path to .xyz file
+                - If plane_csv provided: expects 3D format (x, y, z, nx, ny, nz)
+                - If plane_csv=None: expects 2D format (x, y, nx, ny)
+            on_surface_points: Number of on-surface points per batch
+            plane_csv: Optional CSV with plane parameters (p0x,p0y,p0z,nx,ny,nz)
+            use_signed_labels: If True, off-surface points get +1/-1 labels based on normals
+            k_neighbors: Number of neighbors for sign determination
+            vis_sampled_point: Enable batch visualization
+            vis_frequency: Save visualization every N epochs
+            vis_dir: Directory to save visualizations
+        """
+        super().__init__()
+        
+        self.on_surface_points = on_surface_points
+        self.use_signed_labels = use_signed_labels
+        self.k_neighbors = k_neighbors
+        self.plane_csv = plane_csv
+        self.data_source = "unknown"
+        
+        # Load data based on whether plane_csv is provided
+        if plane_csv is not None:
+            # Case 1: 3D point cloud + plane definition
+            self._load_3d_with_plane(pointcloud_path, plane_csv)
+        else:
+            # Case 2: Data already in 2D format
+            self._load_2d_data(pointcloud_path)
+        
+        # Setup for signed labeling if needed
+        if self.use_signed_labels:
+            print(f"  Signed labels ENABLED: fitting kNN (k={k_neighbors}) for sign determination...")
+            from sklearn.neighbors import NearestNeighbors
+            self.knn_model = NearestNeighbors(n_neighbors=k_neighbors)
+            self.knn_model.fit(self.points_norm)
+            self.on_normals = self.normals
+        else:
+            print(f"  Signed labels DISABLED: using original -1 for all off-surface points")
+        
+        # Visualization setup
+        self.vis_sampled_point = vis_sampled_point
+        self.vis_frequency = vis_frequency
+        self.vis_dir = vis_dir
+        self.epoch_counter = 0
+        
+        # Print dataset info
+        self._print_info()
+        
+        if self.vis_sampled_point and self.vis_dir:
+            os.makedirs(self.vis_dir, exist_ok=True)
+            mode_str = 'signed' if use_signed_labels else 'original'
+            print(f"  Batch visualizations ({mode_str} mode) saved every {self.vis_frequency} epochs to: {self.vis_dir}")
+    
+    def _load_2d_data(self, pointcloud_path):
+        """Load data that's already in 2D format (x, y, nx, ny)."""
+        print(f"Loading 2D point cloud from: {pointcloud_path}")
+        data = np.genfromtxt(pointcloud_path)
+        
+        self.points_raw = data[:, :2]  # Store raw points
+        self.normals = data[:, 2:4]
+        
+        # Normalize to [-1, 1]
+        self.points_raw -= np.mean(self.points_raw, axis=0, keepdims=True)
+        coord_max = np.amax(np.abs(self.points_raw))
+        if coord_max < 1e-6:
+            coord_max = 1.0
+        self.points_norm = self.points_raw / coord_max
+        
+        self.data_source = "2D direct"
+        self.transform_info = None  # No transform for 2D data
+    
+    def _load_plane_csv(self, plane_csv):
+        """Load plane parameters from CSV file."""
+        plane_params = np.loadtxt(plane_csv, delimiter=",", skiprows=1)
+        if plane_params.ndim == 1:
+            plane_params = plane_params.reshape(1, -1)
+        return plane_params[0, :3], plane_params[0, 3:6]
+    
+    def _transform_plane_to_xy(self, points_3d, normals_3d, plane_origin, plane_normal):
+        """Transform points and normals so plane becomes XY plane."""
+        # Shift to plane origin
+        points_shifted = points_3d - plane_origin
+        
+        # Build rotation matrix to align plane_normal with [0, 0, 1]
+        z_axis = plane_normal / np.linalg.norm(plane_normal)
+        
+        # Find arbitrary perpendicular vectors
+        if abs(z_axis[0]) < 0.9:
+            x_axis = np.cross(z_axis, [1, 0, 0])
+        else:
+            x_axis = np.cross(z_axis, [0, 1, 0])
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis = y_axis / np.linalg.norm(y_axis)
+        
+        # Rotation matrix
+        R = np.vstack([x_axis, y_axis, z_axis]).T
+        
+        # Apply rotation
+        points_rotated = points_shifted @ R
+        points_2d = points_rotated[:, :2]
+        
+        # Transform and project normals
+        normals_rotated = normals_3d @ R
+        normals_2d = normals_rotated[:, :2]
+        norm_norms = np.linalg.norm(normals_2d, axis=1, keepdims=True)
+        normals_2d = normals_2d / (norm_norms + 1e-8)
+        
+        # Store transform info for potential back-transform
+        transform_info = {
+            'rotation_matrix': R,
+            'plane_origin': plane_origin,
+            'x_axis': x_axis,
+            'y_axis': y_axis,
+            'z_axis': z_axis
+        }
+        
+        return points_2d, normals_2d, transform_info
+    
+    def _normalize_to_unit_square(self, points_2d):
+        """Normalize 2D points to [-1, 1] range."""
+        mean = np.mean(points_2d, axis=0, keepdims=True)
+        points_centered = points_2d - mean
+        
+        max_abs = np.amax(np.abs(points_centered))
+        if max_abs < 1e-6:
+            max_abs = 1.0
+        
+        scale = max_abs
+        points_norm = points_centered / scale
+        
+        norm_params = {
+            'mean': mean.flatten(),
+            'scale': scale
+        }
+        
+        return points_norm, norm_params
+    
+    def _load_3d_with_plane(self, pointcloud_path, plane_csv):
+        """Load 3D point cloud and transform using plane parameters."""
+        print(f"Loading 3D point cloud from: {pointcloud_path}")
+        print(f"Loading plane from: {plane_csv}")
+        
+        # Load point cloud
+        data = np.genfromtxt(pointcloud_path)
+        points_3d = data[:, :3]
+        normals_3d = data[:, 3:6]
+        print(f"  Loaded {len(points_3d)} points")
+        
+        # Load plane parameters
+        plane_origin, plane_normal = self._load_plane_csv(plane_csv)
+        print(f"  Plane origin: {plane_origin}")
+        print(f"  Plane normal: {plane_normal}")
+        
+        # Transform to XY plane
+        self.points_raw, self.normals, self.transform_info = self._transform_plane_to_xy(
+            points_3d, normals_3d, plane_origin, plane_normal
+        )
+        
+        # Normalize to [-1, 1]
+        self.points_norm, self.norm_params = self._normalize_to_unit_square(self.points_raw)
+        
+        self.data_source = "3D + plane"
+    
+    def _print_info(self):
+        """Print dataset information."""
+        print(f"\n2D Dataset ready ({self.data_source}):")
+        print(f"  Points: {len(self.points_norm)} on-surface points")
+        print(f"  Normalized range: u=[{self.points_norm[:,0].min():.3f}, {self.points_norm[:,0].max():.3f}], "
+              f"v=[{self.points_norm[:,1].min():.3f}, {self.points_norm[:,1].max():.3f}]")
+        print(f"  Label mode: {'SIGNED (+1/-1)' if self.use_signed_labels else 'ORIGINAL (-1 only)'}")
+    
+    def __len__(self):
+        return max(1, self.points_norm.shape[0] // self.on_surface_points)
+    
+    def _label_off_surface_points_signed(self, off_coords_norm):
+        """Assign signed values (+1 outside, -1 inside) using kNN."""
+        N_off = off_coords_norm.shape[0]
+        distances, indices = self.knn_model.kneighbors(off_coords_norm)
+        
+        neighbor_normals = self.normals[indices]  # [N_off, k, 2]
+        vectors = off_coords_norm[:, np.newaxis, :] - self.points_norm[indices]  # [N_off, k, 2]
+        
+        proj = np.sum(vectors * neighbor_normals, axis=2)  # [N_off, k]
+        mean_proj = np.mean(proj, axis=1)
+        
+        signs = np.where(mean_proj > 0, 1.0, -1.0)
+        return signs
+    
+    def __getitem__(self, idx):
+        n_points = self.points_norm.shape[0]
+        
+        # On-surface points
+        if n_points >= self.on_surface_points:
+            on_idx = np.random.choice(n_points, self.on_surface_points, replace=False)
+        else:
+            on_idx = np.random.choice(n_points, self.on_surface_points, replace=True)
+        
+        on_coords = self.points_norm[on_idx]
+        on_normals = self.normals[on_idx]
+        
+        # Off-surface points
+        off_coords = np.random.uniform(-1, 1, size=(self.on_surface_points, 2))
+        off_normals = np.ones((self.on_surface_points, 2)) * -1
+        
+        # Determine SDF values based on mode
+        sdf_on = np.zeros(self.on_surface_points)
+        
+        if self.use_signed_labels:
+            off_signs = self._label_off_surface_points_signed(off_coords)
+            sdf_off = off_signs
+        else:
+            sdf_off = np.ones(self.on_surface_points) * -1
+        
+        sdf = np.concatenate([sdf_on, sdf_off])
+        coords = np.vstack([on_coords, off_coords])
+        normals = np.vstack([on_normals, off_normals])
+        
+        # Visualization
+        if (self.vis_sampled_point and self.vis_dir and idx == 0 and 
+            self.epoch_counter % self.vis_frequency == 0):
+            
+            if self.use_signed_labels:
+                visualize_training_batch_signed(
+                    coords=coords,
+                    gt_sdf=sdf.reshape(-1, 1),
+                    epoch=self.epoch_counter,
+                    save_dir=self.vis_dir,
+                    batch_idx=idx
+                )
+            else:
+                visualize_training_batch_original(
+                    coords=coords,
+                    gt_sdf=sdf.reshape(-1, 1),
+                    epoch=self.epoch_counter,
+                    save_dir=self.vis_dir,
+                    batch_idx=idx
+                )
+        
+        if idx == 0:
+            self.epoch_counter += 1
+        
+        return {
+            'coords': torch.from_numpy(coords).float()
+        }, {
+            'sdf': torch.from_numpy(sdf).float().unsqueeze(-1),
+            'normals': torch.from_numpy(normals).float()
+        }
+    
+    def transform_back(self, points_2d_norm):
+        """
+        Transform normalized points back to original 3D space.
+        Only works if data came from 3D + plane (has transform_info).
+        """
+        if self.transform_info is None:
+            raise ValueError("transform_back only available for data loaded with plane_csv")
+        
+        # Denormalize
+        points_2d = points_2d_norm * self.norm_params['scale'] + self.norm_params['mean']
+        
+        # Add z=0
+        points_3d_plane = np.hstack([points_2d, np.zeros((points_2d.shape[0], 1))])
+        
+        # Rotate back
+        R_inv = np.linalg.inv(self.transform_info['rotation_matrix'])
+        points_rotated = points_3d_plane @ R_inv
+        
+        # Shift back
+        points_3d = points_rotated + self.transform_info['plane_origin']
+        
+        return points_3d
