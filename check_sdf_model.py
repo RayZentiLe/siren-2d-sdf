@@ -201,7 +201,172 @@ def random_points(n, span, dim=3):
     """Generate random points in [-span, span]^dim"""
     return np.random.uniform(-span, span, size=(n, dim)).astype(np.float32)
 
-# ------------------------ NEW: Contour Visualization Functions ---------------------------
+# ---------------------- Load PLY helper function ----------------------
+
+def load_ply_points(ply_path):
+    """
+    Load 3D points (with optional RGB) from PLY file.
+    Returns: points [N, 3], colors [N, 3] or None
+    """
+    if not os.path.exists(ply_path):
+        print(f"  Warning: PLY file not found: {ply_path}")
+        return None, None
+    
+    points = []
+    colors = []
+    has_colors = False
+    
+    with open(ply_path, 'r') as f:
+        # Parse header
+        header_done = False
+        num_verts = 0
+        has_r = has_g = has_b = False
+        
+        for line in f:
+            line = line.strip()
+            if line.startswith('element vertex'):
+                num_verts = int(line.split()[-1])
+            elif line.startswith('property uchar red'):
+                has_r = True
+            elif line.startswith('property uchar green'):
+                has_g = True
+            elif line.startswith('property uchar blue'):
+                has_b = True
+            elif line == 'end_header':
+                header_done = True
+                break
+        
+        has_colors = has_r and has_g and has_b
+        
+        # Parse vertices
+        for i, line in enumerate(f):
+            if i >= num_verts:
+                break
+            parts = line.strip().split()
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            points.append([x, y, z])
+            
+            if has_colors:
+                r, g, b = int(parts[3]), int(parts[4]), int(parts[5])
+                colors.append([r, g, b])
+    
+    points = np.array(points, dtype=np.float32)
+    colors = np.array(colors, dtype=np.uint8) if colors else None
+    
+    return points, colors
+
+# ---------------------- Overlay visualization helper ----------------------
+
+def create_overlay_analysis_2d(sdf_grid, x_grid, y_grid, points_list, output_dir):
+    """
+    Create analysis images with overlaid point clouds.
+    Generates 3 files (heatmap, contour, zero-level) x 2 subplots (one per point cloud).
+    
+    Args:
+        sdf_grid: [N, N] SDF values
+        x_grid, y_grid: coordinate arrays
+        points_list: list of (points [M, 3], colors [M, 3], label_str) tuples
+        output_dir: directory to save results
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    extent = [x_grid.min(), x_grid.max(), y_grid.min(), y_grid.max()]
+    
+    # Extract 2D coordinates and colors for overlay
+    points_2d_list = []
+    for pts, colors, label in points_list:
+        if pts is None:
+            points_2d_list.append((None, None, label))
+        else:
+            points_2d = pts[:, :2]  # Extract u, v
+            points_2d_list.append((points_2d, colors, label))
+    
+    # File 1: Heatmap + overlays
+    fig, axes = plt.subplots(1, len(points_2d_list), figsize=(8 * len(points_2d_list), 7))
+    if len(points_2d_list) == 1:
+        axes = [axes]
+    
+    for ax_idx, (pts_2d, colors_2d, label) in enumerate(points_2d_list):
+        ax = axes[ax_idx]
+        im = ax.imshow(sdf_grid.T, origin='lower', extent=extent,
+                       cmap='RdBu_r', vmin=-0.5, vmax=0.5)
+        
+        if pts_2d is not None:
+            # Overlay points with original colors
+            if colors_2d is not None:
+                ax.scatter(pts_2d[:, 0], pts_2d[:, 1], c=colors_2d/255.0, s=3, alpha=0.8)
+            else:
+                ax.scatter(pts_2d[:, 0], pts_2d[:, 1], c='black', s=3, alpha=0.5)
+        
+        ax.set_title(f'SDF Heatmap - {label}')
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_aspect('equal')
+        plt.colorbar(im, ax=ax, label='SDF Value')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'sdf_overlay_heatmap.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved heatmap overlay to: sdf_overlay_heatmap.png")
+    
+    # File 2: Contour lines + overlays
+    fig, axes = plt.subplots(1, len(points_2d_list), figsize=(8 * len(points_2d_list), 7))
+    if len(points_2d_list) == 1:
+        axes = [axes]
+    
+    for ax_idx, (pts_2d, colors_2d, label) in enumerate(points_2d_list):
+        ax = axes[ax_idx]
+        contour = ax.contour(x_grid, y_grid, sdf_grid.T, levels=20, cmap='viridis', linewidths=1)
+        
+        if pts_2d is not None:
+            # Overlay points with original colors
+            if colors_2d is not None:
+                ax.scatter(pts_2d[:, 0], pts_2d[:, 1], c=colors_2d/255.0, s=3, alpha=0.8)
+            else:
+                ax.scatter(pts_2d[:, 0], pts_2d[:, 1], c='black', s=3, alpha=0.5)
+        
+        ax.set_title(f'Contour Lines - {label}')
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_aspect('equal')
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        plt.colorbar(contour, ax=ax, label='SDF Value')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'sdf_overlay_contours.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved contour overlay to: sdf_overlay_contours.png")
+    
+    # File 3: Zero level set + overlays
+    fig, axes = plt.subplots(1, len(points_2d_list), figsize=(8 * len(points_2d_list), 7))
+    if len(points_2d_list) == 1:
+        axes = [axes]
+    
+    for ax_idx, (pts_2d, colors_2d, label) in enumerate(points_2d_list):
+        ax = axes[ax_idx]
+        zero_contour = ax.contour(x_grid, y_grid, sdf_grid.T, levels=[0], colors='red', linewidths=2)
+        
+        if pts_2d is not None:
+            # Overlay points with original colors
+            if colors_2d is not None:
+                ax.scatter(pts_2d[:, 0], pts_2d[:, 1], c=colors_2d/255.0, s=3, alpha=0.8)
+            else:
+                ax.scatter(pts_2d[:, 0], pts_2d[:, 1], c='black', s=3, alpha=0.5)
+        
+        ax.set_title(f'Zero Level Set - {label}')
+        ax.set_xlabel('u')
+        ax.set_ylabel('v')
+        ax.set_aspect('equal')
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'sdf_overlay_zero_level.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved zero level set overlay to: sdf_overlay_zero_level.png")
+
+# ------------------------ Contour Visualization Functions ---------------------------
 
 def visualize_sdf_contours_2d(sdf_grid, x_grid, y_grid, output_path, 
                                levels=20, highlight_zero=True):
@@ -900,6 +1065,10 @@ def main():
     ap.add_argument("--grad", type=int, default=50000, help="Number of points for Eikonal (autograd).")
     ap.add_argument("--contour-file", type=str, default=None, 
                     help="CSV file with contour points (u,v) for 2D accuracy check")
+    ap.add_argument("--on-surface-points", type=str, default=None, 
+                    help="PLY file with on-surface points for overlay visualization")
+    ap.add_argument("--all-points", type=str, default=None, 
+                    help="PLY file with all training points for overlay visualization")
     ap.add_argument("--mesh", type=str, default=None, help="Optional watertight mesh (only for 3D).")
     ap.add_argument("--surf", type=int, default=50000, help="Surface points to sample if mesh is provided.")
     ap.add_argument("--w0", type=float, default=30.0)
@@ -945,7 +1114,7 @@ def main():
         save_2d_sdf_plot(G, x_grid, y_grid, f"2D SDF Grid (N={args.grid})",
                          os.path.join(args.outdir, "sdf_2d_grid.png"))
         
-        # ===== NEW: Enhanced contour visualization =====
+        # ===== Enhanced contour visualization =====
         print("\n[3] Creating enhanced contour visualizations...")
         
         # Comprehensive contour plot
@@ -960,6 +1129,22 @@ def main():
             G, x_grid, y_grid,
             os.path.join(args.outdir, "zero_contour.png")
         )
+        
+        # ===== Point cloud overlay analysis =====
+        if args.on_surface_points or args.all_points:
+            print("\n[3b] Creating point cloud overlay visualizations...")
+            points_list = []
+            
+            if args.on_surface_points:
+                pts_on_surface, colors_on_surface = load_ply_points(args.on_surface_points)
+                points_list.append((pts_on_surface, colors_on_surface, "On-surface Points"))
+            
+            if args.all_points:
+                pts_all, colors_all = load_ply_points(args.all_points)
+                points_list.append((pts_all, colors_all, "All Training Points"))
+            
+            if points_list:
+                create_overlay_analysis_2d(G, x_grid, y_grid, points_list, args.outdir)
         
         # If contour file provided, compare with original
         if args.contour_file:

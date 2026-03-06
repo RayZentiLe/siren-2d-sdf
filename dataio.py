@@ -431,12 +431,14 @@ def visualize_training_batch_signed(coords, gt_sdf, epoch, save_dir, batch_idx=0
     print(f"  Saved signed batch visualization to: {save_path}")
 
 
-def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir, batch_idx=0):
+def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir, batch_idx=0, on_surface_coords=None):
     """
     Visualization for REAL SDF values with color mapping.  
-    In 2D this produces a set of matplotlib plots; in 3D the
-    batch is written to a colored PLY file (on-surface points black,
-    off-surface colored by distance).
+    In 2D: produces matplotlib plots AND saves PLY files (colored batch + on-surface reference).
+    In 3D: writes colored PLY file (on-surface points black, off-surface colored by distance).
+    
+    Args:
+        on_surface_coords: [N_on, 2] or [N_on, 3] on-surface reference points (for 2D PLY export)
     """
     os.makedirs(save_dir, exist_ok=True)
     coords = np.asarray(coords)
@@ -491,6 +493,53 @@ def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir
         save_path = os.path.join(save_dir, filename)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+        print(f"  Saved 2D batch PNG to: {save_path}")
+
+        # Export colored batch PLY (on-surface black, off-surface by signed distance)
+        # Use RdBu_r: red for positive, blue for negative, white/light near zero
+        colors = np.zeros((n_points, 3), dtype=np.uint8)
+        if len(off_sdf) > 0:
+            # Use symmetric range around zero like the 2D plot
+            vmin = -0.5
+            vmax = 0.5
+            norm = plt.Normalize(vmin=vmin, vmax=vmax)
+            cmap = plt.cm.RdBu_r
+            mapped = cmap(norm(off_sdf))[:, :3]
+            colors[n_on:] = (mapped * 255).astype(np.uint8)
+        filename_colored = f'real_sdf_colored_epoch_{epoch:04d}_batch_{batch_idx:02d}.ply'
+        save_path_colored = os.path.join(save_dir, filename_colored)
+        with open(save_path_colored, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {n_points}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for i in range(n_points):
+                x, y = coords[i, :2]
+                r, g, b = colors[i]
+                f.write(f"{x} {y} 0 {r} {g} {b}\n")
+        print(f"  Saved 2D colored batch PLY to: {save_path_colored}")
+
+        # Export on-surface reference PLY
+        if on_surface_coords is not None:
+            on_surface_coords = np.asarray(on_surface_coords)
+            n_on_ref = len(on_surface_coords)
+            filename_ref = f'real_sdf_on_surface_epoch_{epoch:04d}_batch_{batch_idx:02d}.ply'
+            save_path_ref = os.path.join(save_dir, filename_ref)
+            with open(save_path_ref, 'w') as f:
+                f.write("ply\nformat ascii 1.0\n")
+                f.write(f"element vertex {n_on_ref}\n")
+                f.write("property float x\nproperty float y\nproperty float z\n")
+                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+                f.write("end_header\n")
+                for i in range(n_on_ref):
+                    if on_surface_coords.shape[1] == 2:
+                        x, y = on_surface_coords[i, :2]
+                        z = 0.0
+                    else:
+                        x, y, z = on_surface_coords[i, :3]
+                    f.write(f"{x} {y} {z} 0 0 0\n")  # black color
+            print(f"  Saved 2D on-surface reference PLY to: {save_path_ref}")
 
         # Also print stats
         print(f"  REAL SDF stats - mean={off_sdf.mean():.4f}, std={off_sdf.std():.4f}, "
@@ -1596,10 +1645,10 @@ class PointCloud2D(Dataset):
         coords = np.vstack([on_coords, off_coords])
         normals = np.vstack([on_normals, off_normals])
         
-        # Visualization
+        # Visualization: for 2D and 3D, save only first and last batch per epoch
         if (self.vis_sampled_point and self.vis_dir and 
             os.path.exists(os.path.dirname(self.vis_dir)) and 
-            idx == 0 and 
+            (idx == 0 or idx == len(self) - 1) and 
             self.epoch_counter % self.vis_frequency == 0):
             # check if batch_vis exists, if not create it
             if not os.path.exists(self.vis_dir):
@@ -1611,7 +1660,8 @@ class PointCloud2D(Dataset):
                     distances=distances,
                     epoch=self.epoch_counter,
                     save_dir=self.vis_dir,
-                    batch_idx=idx
+                    batch_idx=idx,
+                    on_surface_coords=on_coords  # pass on-surface for reference PLY
                 )
             else:
                 visualize_training_batch_original(
