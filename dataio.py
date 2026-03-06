@@ -496,17 +496,19 @@ def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir
         print(f"  REAL SDF stats - mean={off_sdf.mean():.4f}, std={off_sdf.std():.4f}, "
               f"range=[{off_sdf.min():.4f}, {off_sdf.max():.4f}]")
     elif coords.shape[1] == 3:
-        # build color array: black for on-surface, map off-surface by distance
+        # build color array: black for on-surface, map off-surface by signed sdf
         colors = np.zeros((n_points, 3), dtype=np.uint8)
-        if len(off_dist) > 0:
-            # normalize distances for colormap
-            vmin = off_dist.min()
-            vmax = off_dist.max()
+        if len(off_sdf) > 0:
+            # determine symmetric range around zero for diverging map
+            vmin = off_sdf.min()
+            vmax = off_sdf.max()
+            maxabs = max(abs(vmin), abs(vmax))
+            vmin, vmax = -maxabs, maxabs
             if np.isclose(vmin, vmax):
                 vmax = vmin + 1e-6
             norm = plt.Normalize(vmin=vmin, vmax=vmax)
-            cmap = plt.cm.viridis
-            mapped = cmap(norm(off_dist))[:, :3]  # Nx3 floats
+            cmap = plt.cm.RdBu_r
+            mapped = cmap(norm(off_sdf))[:, :3]  # Nx3 floats
             colors[n_on:] = (mapped * 255).astype(np.uint8)
         # on-surface points remain black (0,0,0)
         # write ply file
@@ -523,6 +525,26 @@ def visualize_training_batch_real_sdf(coords, gt_sdf, distances, epoch, save_dir
                 r, g, b = colors[i]
                 f.write(f"{x} {y} {z} {r} {g} {b}\n")
         print(f"  Saved 3D point cloud visualization to: {save_path}")
+        # also write a second PLY coloured purely by sign (red positive, blue negative)
+        sign_colors = np.zeros((n_points,3), dtype=np.uint8)
+        # off-surface entries start at index n_on
+        if len(off_sdf) > 0:
+            pos = off_sdf > 0
+            neg = off_sdf < 0
+            sign_colors[n_on:][pos] = np.array([255,0,0], dtype=np.uint8)
+            sign_colors[n_on:][neg] = np.array([0,0,255], dtype=np.uint8)
+        signed_path = os.path.join(save_dir, f'real_sdf_epoch_{epoch:04d}_batch_{batch_idx:02d}_signed.ply')
+        with open(signed_path, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {n_points}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for i in range(n_points):
+                x, y, z = coords[i]
+                r, g, b = sign_colors[i]
+                f.write(f"{x} {y} {z} {r} {g} {b}\n")
+        print(f"  Saved 3D signed-only point cloud to: {signed_path}")
     else:
         raise ValueError(f"Unsupported coordinate dimension {coords.shape[1]} for visualization")
 
