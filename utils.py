@@ -10,6 +10,237 @@ import cv2
 import meta_modules
 import scipy.io.wavfile as wavfile
 import cmapy
+import pandas as pd
+from pathlib import Path
+
+
+def unit(v: np.ndarray) -> np.ndarray:
+    """Return the unit (normalized) vector of v. Raises if v is (near) zero."""
+    v = np.asarray(v, dtype=float)
+    norm = np.linalg.norm(v)
+    if norm < 1e-12:
+        raise ValueError("Cannot normalize a zero-length vector.")
+    return v / norm
+
+
+def orthonormal_basis_from_normal(n):
+    """
+    Create (u, v) spanning the plane perpendicular to n.
+    """
+    n = unit(n)
+    a = np.array([0.0, 0.0, 1.0], dtype=float)
+    if abs(np.dot(n, a)) > 0.95:
+        a = np.array([0.0, 1.0, 0.0], dtype=float)
+    u = unit(np.cross(a, n))
+    v = unit(np.cross(n, u))
+    return u, v
+
+PLY_TYPE_TO_DTYPE = {
+    "char": np.int8, "int8": np.int8,
+    "uchar": np.uint8, "uint8": np.uint8,
+    "short": np.int16, "int16": np.int16,
+    "ushort": np.uint16, "uint16": np.uint16,
+    "int": np.int32, "int32": np.int32,
+    "uint": np.uint32, "uint32": np.uint32,
+    "float": np.float32, "float32": np.float32,
+    "double": np.float64, "float64": np.float64,
+}
+
+def load_ply_xyz(ply_path):
+    """
+    Loads vertex positions x,y,z from a PLY.
+    Supports:
+      - format ascii
+      - format binary_little_endian
+    Ignores faces and other elements.
+    """
+    ply_path = Path(ply_path)
+    with ply_path.open("rb") as f:
+        header = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError("Unexpected EOF while reading PLY header.")
+            s = line.decode("utf-8", errors="ignore").strip()
+            header.append(s)
+            if s == "end_header":
+                break
+
+        fmt = None
+        n_verts = None
+        vertex_props = []
+        in_vertex = False
+
+        for h in header:
+            if h.startswith("format"):
+                fmt = h.split()[1]
+            elif h.startswith("element vertex"):
+                n_verts = int(h.split()[-1])
+                in_vertex = True
+            elif h.startswith("element") and not h.startswith("element vertex"):
+                in_vertex = False
+            elif in_vertex and h.startswith("property"):
+                parts = h.split()
+                if len(parts) >= 3:
+                    ptype, pname = parts[1], parts[2]
+                    if ptype == "list":
+                        continue
+                    if ptype not in PLY_TYPE_TO_DTYPE:
+                        raise ValueError(f"Unsupported PLY property type: {ptype}")
+                    vertex_props.append((pname, PLY_TYPE_TO_DTYPE[ptype]))
+
+        if fmt is None or n_verts is None:
+            raise ValueError("PLY missing 'format' or 'element vertex'.")
+
+        prop_names = [p[0] for p in vertex_props]
+        for k in ("x", "y", "z"):
+            if k not in prop_names:
+                raise ValueError(f"PLY missing required vertex property '{k}'. Found: {prop_names}")
+
+        if fmt == "binary_little_endian":
+            fields = [(name, np.dtype(dt).newbyteorder("<")) for name, dt in vertex_props]
+            v_dtype = np.dtype(fields)
+            data = np.fromfile(f, dtype=v_dtype, count=n_verts)
+            pts = np.column_stack([data["x"], data["y"], data["z"]]).astype(np.float64)
+            return pts
+
+        elif fmt == "ascii":
+            name_to_idx = {name: i for i, (name, _) in enumerate(vertex_props)}
+            rows = []
+            for _ in range(n_verts):
+                line = f.readline()
+                if not line:
+                    break
+                parts = line.decode("utf-8", errors="ignore").strip().split()
+                if parts:
+                    rows.append(parts)
+            arr = np.asarray(rows, dtype=np.float64)
+            pts = np.column_stack([
+                arr[:, name_to_idx["x"]],
+                arr[:, name_to_idx["y"]],
+                arr[:, name_to_idx["z"]],
+            ])
+            return pts
+
+
+def load_ply_xyz_normals(input_path):
+    """
+    Loads vertex positions x,y,z from a PLY or XYZ file and returns normals if present.
+    Supports:
+      - .ply files (ASCII or binary_little_endian format)
+      - .xyz files (space-separated text: x y z [nx ny nz])
+    Returns: (pts (N,3) as float64, normals (N,3) as float64 or None)
+    """
+    input_path = Path(input_path)
+    suffix = input_path.suffix.lower()
+    
+    if suffix == ".xyz":
+        # Load XYZ file (space-separated text)
+        data = np.loadtxt(input_path, dtype=np.float64)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        
+        if data.shape[1] < 3:
+            raise ValueError(f"XYZ file must have at least 3 columns (x, y, z). Found {data.shape[1]}")
+        
+        pts = data[:, :3].astype(np.float64)
+        
+        # Check if normals are present (6 columns total)
+        if data.shape[1] >= 6:
+            normals = data[:, 3:6].astype(np.float64)
+        else:
+            normals = None
+        
+        return pts, normals
+    
+    elif suffix == ".ply":
+        # Load PLY file (ASCII or binary format)
+        with input_path.open("rb") as f:
+            header = []
+            while True:
+                line = f.readline()
+                if not line:
+                    raise ValueError("Unexpected EOF while reading PLY header.")
+                s = line.decode("utf-8", errors="ignore").strip()
+                header.append(s)
+                if s == "end_header":
+                    break
+
+            fmt = None
+            n_verts = None
+            vertex_props = []
+            in_vertex = False
+
+            for h in header:
+                if h.startswith("format"):
+                    fmt = h.split()[1]
+                elif h.startswith("element vertex"):
+                    n_verts = int(h.split()[-1])
+                    in_vertex = True
+                elif h.startswith("element") and not h.startswith("element vertex"):
+                    in_vertex = False
+                elif in_vertex and h.startswith("property"):
+                    parts = h.split()
+                    if len(parts) >= 3:
+                        ptype, pname = parts[1], parts[2]
+                        if ptype == "list":
+                            continue
+                        if ptype not in PLY_TYPE_TO_DTYPE:
+                            raise ValueError(f"Unsupported PLY property type: {ptype}")
+                        vertex_props.append((pname, PLY_TYPE_TO_DTYPE[ptype]))
+
+            if fmt is None or n_verts is None:
+                raise ValueError("PLY missing 'format' or 'element vertex'.")
+
+            prop_names = [p[0] for p in vertex_props]
+            for k in ("x", "y", "z"):
+                if k not in prop_names:
+                    raise ValueError(f"PLY missing required vertex property '{k}'. Found: {prop_names}")
+
+            normals_present = all(k in prop_names for k in ("nx", "ny", "nz"))
+
+            if fmt == "binary_little_endian":
+                fields = [(name, np.dtype(dt).newbyteorder("<")) for name, dt in vertex_props]
+                v_dtype = np.dtype(fields)
+                data = np.fromfile(f, dtype=v_dtype, count=n_verts)
+                pts = np.column_stack([data["x"], data["y"], data["z"]]).astype(np.float64)
+                if normals_present:
+                    normals = np.column_stack([data["nx"], data["ny"], data["nz"]]).astype(np.float64)
+                else:
+                    normals = None
+                return pts, normals
+
+            elif fmt == "ascii":
+                name_to_idx = {name: i for i, (name, _) in enumerate(vertex_props)}
+                rows = []
+                for _ in range(n_verts):
+                    line = f.readline()
+                    if not line:
+                        break
+                    parts = line.decode("utf-8", errors="ignore").strip().split()
+                    if parts:
+                        rows.append(parts)
+                arr = np.asarray(rows, dtype=np.float64)
+                pts = np.column_stack([
+                    arr[:, name_to_idx["x"]],
+                    arr[:, name_to_idx["y"]],
+                    arr[:, name_to_idx["z"]],
+                ])
+                if normals_present:
+                    normals = np.column_stack([
+                        arr[:, name_to_idx["nx"]],
+                        arr[:, name_to_idx["ny"]],
+                        arr[:, name_to_idx["nz"]],
+                    ]).astype(np.float64)
+                else:
+                    normals = None
+                return pts, normals
+
+            else:
+                raise ValueError(f"Unsupported PLY format: {fmt} (supported: ascii, binary_little_endian)")
+    
+    else:
+        raise ValueError(f"Unsupported file format: {suffix}. Supported: .ply, .xyz")
 
 
 def cond_mkdir(path):
